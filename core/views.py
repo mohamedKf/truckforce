@@ -769,34 +769,37 @@ class ClockInView(APIView):
     permission_classes = [IsDriver]
 
     def post(self, request):
-        today = localdate()
-
         # Validate input FIRST before touching the DB
         ser = ClockInSerializer(data=request.data)
         if not ser.is_valid():
             print(f"[CLOCK-IN] Serializer errors: {ser.errors}", flush=True)
             return Response(ser.errors, status=400)
 
-        att, created = Attendance.objects.get_or_create(
-            driver=request.driver, date=today
-        )
-        print(f"[CLOCK-IN] driver={request.driver.id} today={today} "
-              f"existing_ci={att.clock_in} existing_co={att.clock_out} created={created}",
-              flush=True)
+        # Check if driver has ANY open shift (no midnight barrier)
+        open_att = Attendance.objects.filter(
+            driver=request.driver,
+            clock_in__isnull=False,
+            clock_out__isnull=True,
+        ).first()
 
-        if att.clock_in is not None:
+        if open_att:
             return Response({
-                'error': 'Already clocked in today',
-                'clock_in': att.clock_in.isoformat(),
+                'error': 'Already clocked in',
+                'clock_in': open_att.clock_in.isoformat(),
+                'date': str(open_att.date),
             }, status=400)
 
-        if att.clock_out:
-            return Response({'error': 'Already completed shift today'}, status=400)
+        # Create new record dated today (clock-in date)
+        today = localdate()
+        att = Attendance.objects.create(
+            driver=request.driver,
+            date=today,
+            clock_in=timezone.now(),
+            clock_in_lat=round(float(ser.validated_data['latitude']), 6) if ser.validated_data.get('latitude') else None,
+            clock_in_lng=round(float(ser.validated_data['longitude']), 6) if ser.validated_data.get('longitude') else None,
+        )
+        print(f"[CLOCK-IN] driver={request.driver.id} date={today} time={att.clock_in}", flush=True)
 
-        att.clock_in     = timezone.now()
-        att.clock_in_lat = ser.validated_data.get('latitude')
-        att.clock_in_lng = ser.validated_data.get('longitude')
-        att.save()
         try:
             schedule = DailySchedule.objects.get(driver=request.driver, date=today)
             if schedule.status == 'pending':
@@ -804,19 +807,7 @@ class ClockInView(APIView):
                 schedule.save()
         except DailySchedule.DoesNotExist:
             pass
-        publish_event('attendance_changed', by_user_id=getattr(request.driver, 'id', None))
-        return Response(AttendanceSerializer(att).data)
-        att.clock_in     = timezone.now()
-        att.clock_in_lat = ser.validated_data.get('latitude')
-        att.clock_in_lng = ser.validated_data.get('longitude')
-        att.save()
-        try:
-            schedule = DailySchedule.objects.get(driver=request.driver, date=today)
-            if schedule.status == 'pending':
-                schedule.status = 'in_progress'
-                schedule.save()
-        except DailySchedule.DoesNotExist:
-            pass
+
         publish_event('attendance_changed', by_user_id=getattr(request.driver, 'id', None))
         return Response(AttendanceSerializer(att).data)
 
@@ -825,21 +816,24 @@ class ClockOutView(APIView):
     permission_classes = [IsDriver]
 
     def post(self, request):
-        today = localdate()
-        try:
-            att = Attendance.objects.get(driver=request.driver, date=today)
-        except Attendance.DoesNotExist:
+        # Find ANY open shift — no date filter (supports night shifts)
+        att = Attendance.objects.filter(
+            driver=request.driver,
+            clock_in__isnull=False,
+            clock_out__isnull=True,
+        ).order_by('clock_in').last()
+
+        if not att:
             return Response({'error': 'Not clocked in'}, status=400)
-        if not att.clock_in:
-            return Response({'error': 'Not clocked in'}, status=400)
-        if att.clock_out:
-            return Response({'error': 'Already clocked out'}, status=400)
+
         ser = ClockOutSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
+
         att.clock_out     = timezone.now()
-        att.clock_out_lat = ser.validated_data.get('latitude')
-        att.clock_out_lng = ser.validated_data.get('longitude')
+        att.clock_out_lat = round(float(ser.validated_data['latitude']), 6) if ser.validated_data.get('latitude') else None
+        att.clock_out_lng = round(float(ser.validated_data['longitude']), 6) if ser.validated_data.get('longitude') else None
         att.notes         = ser.validated_data.get('notes', '')
+
         try:
             from .models import CompanySettings
             company = CompanySettings.objects.first()
@@ -847,10 +841,11 @@ class ClockOutView(APIView):
             att.calculate_hours(overtime_threshold=ot_threshold, ot_125_limit=2.0)
         except Exception:
             pass
+
         att.save()
+        print(f"[CLOCK-OUT] driver={request.driver.id} date={att.date} hours={att.total_hours}", flush=True)
         publish_event('attendance_changed', by_user_id=getattr(request.driver, 'id', None))
         return Response(AttendanceSerializer(att).data)
-
 
 class AttendanceDetailView(APIView):
     """Manager can edit attendance records."""
@@ -1138,17 +1133,19 @@ class DashboardStatsView(APIView):
 
 
 class DriverLocationUpdateView(APIView):
-    """Driver phone posts current GPS location (every 30s while clocked in)."""
+    """Driver phone posts current GPS location while clocked in."""
     permission_classes = [IsDriver]
 
     def post(self, request):
         driver = request.driver
 
-        # Only record if driver is currently clocked in
-        today = localdate()
+        # Find any open shift — no date filter (supports night shifts)
         attendance = Attendance.objects.filter(
-            driver=driver, date=today, clock_out__isnull=True
+            driver=driver,
+            clock_in__isnull=False,
+            clock_out__isnull=True,
         ).first()
+
         if not attendance:
             return Response(
                 {'error': 'Not clocked in'},
@@ -1183,25 +1180,26 @@ class DriverLocationUpdateView(APIView):
 
 
 class ActiveDriversLocationsView(APIView):
-    """Manager desktop fetches all currently-clocked-in drivers with their latest location + today's trail."""
+    """Manager desktop fetches all currently-clocked-in drivers with latest location + trail."""
     permission_classes = [IsManager]
 
     def get(self, request):
         today = localdate()
 
-        # Drivers who are clocked in right now (clock_in today, no clock_out yet)
+        # Find all open shifts — no date filter (supports night shifts)
         active_attendances = Attendance.objects.filter(
-            date=today, clock_out__isnull=True
+            clock_in__isnull=False,
+            clock_out__isnull=True,
         ).select_related('driver')
 
         result = []
         for att in active_attendances:
             driver = att.driver
 
-            # Get today's trail (all locations since clock-in)
             since = att.clock_in
             if since is None:
                 continue
+
             trail_qs = DriverLocation.objects.filter(
                 driver=driver, timestamp__gte=since
             ).order_by('timestamp')
@@ -1213,10 +1211,10 @@ class ActiveDriversLocationsView(APIView):
 
             latest = trail_qs.last()
 
-            # Today's stops
+            # Stops for the shift date (use att.date not today)
             stops_today = Stop.objects.filter(
                 schedule__driver=driver,
-                schedule__date=today,
+                schedule__date=att.date,
             ).order_by('order')
 
             stops_data = [{
@@ -1229,9 +1227,9 @@ class ActiveDriversLocationsView(APIView):
                 'status': s.status,
             } for s in stops_today]
 
-            # Get truck info from driver's schedule today
+            # Truck info from shift date schedule
             try:
-                daily_schedule = DailySchedule.objects.get(driver=driver, date=today)
+                daily_schedule = DailySchedule.objects.get(driver=driver, date=att.date)
                 truck_plate = daily_schedule.truck.plate_number if daily_schedule.truck else None
                 truck_model = f"{daily_schedule.truck.brand} {daily_schedule.truck.model}" if daily_schedule.truck else None
             except DailySchedule.DoesNotExist:
@@ -1239,19 +1237,19 @@ class ActiveDriversLocationsView(APIView):
                 truck_model = None
 
             result.append({
-                'driver_id': driver.id,
-                'driver_name': driver.full_name,
-                'phone': driver.phone,
+                'driver_id':    driver.id,
+                'driver_name':  driver.full_name,
+                'phone':        driver.phone,
                 'license_type': driver.license_type,
-                'photo_url': request.build_absolute_uri(driver.photo.url) if driver.photo else None,
-                'truck_plate': truck_plate,
-                'truck_model': truck_model,
-                'clock_in': att.clock_in.isoformat() if att.clock_in else None,
+                'photo_url':    request.build_absolute_uri(driver.photo.url) if driver.photo else None,
+                'truck_plate':  truck_plate,
+                'truck_model':  truck_model,
+                'clock_in':     att.clock_in.isoformat() if att.clock_in else None,
                 'current_location': {
-                    'lat': float(latest.latitude) if latest else None,
-                    'lng': float(latest.longitude) if latest else None,
-                    'speed': latest.speed if latest else None,
-                    'heading': latest.heading if latest else None,
+                    'lat':       float(latest.latitude) if latest else None,
+                    'lng':       float(latest.longitude) if latest else None,
+                    'speed':     latest.speed if latest else None,
+                    'heading':   latest.heading if latest else None,
                     'timestamp': latest.timestamp.isoformat() if latest else None,
                 } if latest else None,
                 'trail': trail,
@@ -1259,7 +1257,6 @@ class ActiveDriversLocationsView(APIView):
             })
 
         return Response(result)
-
 
 class AccountantListCreateView(APIView):
     """GET list of accountants, POST to create."""
@@ -1378,16 +1375,20 @@ class ChildDetailView(APIView):
 # ── Payslip — list / generate / detail ──────────────────
 class PayslipListView(APIView):
     """GET list of payslips, optionally filtered by year/month/driver."""
-    permission_classes = [IsManager]
+    permission_classes = [IsManagerOrDriver]
 
     def get(self, request):
         qs = Payslip.objects.select_related('driver').all()
-        year = request.query_params.get('year')
-        month = request.query_params.get('month')
-        drv = request.query_params.get('driver')
-        if year:  qs = qs.filter(year=year)
-        if month: qs = qs.filter(month=month)
-        if drv:   qs = qs.filter(driver_id=drv)
+        # Driver sees only their own payslips
+        if hasattr(request, 'driver') and request.driver is not None:
+            qs = qs.filter(driver=request.driver)
+        else:
+            year  = request.query_params.get('year')
+            month = request.query_params.get('month')
+            drv   = request.query_params.get('driver')
+            if year:  qs = qs.filter(year=year)
+            if month: qs = qs.filter(month=month)
+            if drv:   qs = qs.filter(driver_id=drv)
         return Response(PayslipSummarySerializer(qs, many=True).data)
 
 
@@ -1967,3 +1968,20 @@ class DriverPhotoClearB64View(APIView):
         driver.photo_b64 = ''
         driver.save(update_fields=['photo_b64'])
         return Response({'ok': True})
+
+
+
+
+class DriverPingView(APIView):
+    """Manager pings a driver → Firebase event → driver sends location immediately."""
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        try:
+            driver = Driver.objects.get(pk=pk)
+        except Driver.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        # Fire Firebase event targeting this specific driver
+        publish_event('ping_driver', by_user_id=getattr(request.manager, 'id', None),
+                      extra={'driver_id': pk})
+        return Response({'ok': True, 'driver_id': pk})

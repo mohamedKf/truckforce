@@ -98,4 +98,5 @@ urlpatterns = [
     path('driver/photo/',                           views.DriverPhotoUploadView.as_view()),
     path('drivers/<int:pk>/clear-photo-b64/',       views.DriverPhotoClearB64View.as_view()),
 
-]
+    path('drivers/<int:pk>/ping/', views.DriverPingView.as_view()),
+
