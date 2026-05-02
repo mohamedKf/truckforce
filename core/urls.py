@@ -100,3 +100,9 @@ urlpatterns = [
 
     path('drivers/<int:pk>/ping/', views.DriverPingView.as_view()),
 
+    path('version/',                  views.app_version),
+    path('upload-release/',           views.UploadReleaseView.as_view()),
+    path('downloads/<str:filename>',  views.download_release),
+
+
+]

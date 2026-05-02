@@ -1,12 +1,15 @@
+from django.http import JsonResponse, FileResponse, Http404
 from django.utils import timezone
 from django.db import transaction
 from django.db import models
 from django.db.models import Q
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from django.views.decorators.http import require_GET
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
-
+import os
+import json
 from .models import Accountant, PayrollSendLog, DeliveryConfirmation
 from .models import AttendanceFixRequest
 from .serializers import AccountantSerializer, PayrollSendLogSerializer, DeliveryConfirmationSerializer
@@ -60,7 +63,7 @@ from .serializers import (
 from .payroll_calc import generate_payslip, generate_all_payslips
 import datetime
 
-
+RELEASES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'releases')
 # ──────────────────────────────────────────────
 # AUTH
 # ──────────────────────────────────────────────
@@ -1985,3 +1988,92 @@ class DriverPingView(APIView):
         publish_event('ping_driver', by_user_id=getattr(request.manager, 'id', None),
                       extra={'driver_id': pk})
         return Response({'ok': True, 'driver_id': pk})
+
+
+
+
+@require_GET
+def app_version(request):
+    """
+    GET /api/version/
+    No auth — desktop and phone check this on startup.
+    """
+    ver_file = os.path.join(RELEASES_DIR, 'version.json')
+    try:
+        with open(ver_file) as f:
+            return JsonResponse(json.load(f))
+    except FileNotFoundError:
+        return JsonResponse({
+            'version':      '1.0.0',
+            'exe_url':      '',
+            'apk_url':      '',
+            'notes':        'Initial release',
+            'force_update': False,
+        })
+
+
+def download_release(request, filename):
+    """
+    GET /api/downloads/<filename>
+    No auth — driver/manager downloads directly.
+    """
+    safe = os.path.basename(filename)
+    path = os.path.join(RELEASES_DIR, safe)
+    if not os.path.exists(path):
+        raise Http404(f'{safe} not found')
+    return FileResponse(open(path, 'rb'), as_attachment=True, filename=safe)
+
+
+class UploadReleaseView(APIView):
+    """
+    POST /api/upload-release/
+    Called by GitHub Actions after building EXE or APK.
+    Requires manager token.
+    """
+    permission_classes = [IsManager]
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        file_obj  = request.FILES.get('file')
+        file_type = request.data.get('type', '')
+        version   = request.data.get('version', '').strip()
+
+        if not file_obj or not version:
+            return Response({'error': 'file and version required'}, status=400)
+
+        os.makedirs(RELEASES_DIR, exist_ok=True)
+
+        ext      = 'exe' if file_type == 'exe' else 'apk'
+        filename = f'TruckForce-v{version}.{ext}'
+        dest     = os.path.join(RELEASES_DIR, filename)
+
+        with open(dest, 'wb') as f:
+            for chunk in file_obj.chunks():
+                f.write(chunk)
+
+        size_mb = os.path.getsize(dest) / 1024 / 1024
+        print(f"[RELEASE] Saved {filename} ({size_mb:.1f}MB)", flush=True)
+
+        # Update version.json
+        from django.conf import settings
+        base_url = getattr(settings, 'SITE_URL', '').rstrip('/')
+        ver_file = os.path.join(RELEASES_DIR, 'version.json')
+
+        try:
+            with open(ver_file) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        data['version'] = version
+        if file_type == 'exe':
+            data['exe_url'] = f"{base_url}/api/downloads/{filename}"
+        elif file_type == 'apk':
+            data['apk_url'] = f"{base_url}/api/downloads/{filename}"
+
+        with open(ver_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        print(f"[RELEASE] version.json → {version}", flush=True)
+        return Response({'ok': True, 'version': version, 'file': filename})
+
