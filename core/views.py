@@ -116,6 +116,14 @@ class VerifyRegistrationCodeView(APIView):
         if not env_code:
             return Response({'error': 'No registration code configured on server. Contact your admin.'}, status=403)
         if env_code != code:
+            # TEMPORARY DEBUG: log what's being compared so we can spot
+            # invisible-character mismatches between env and submitted code.
+            # Remove after this is diagnosed.
+            print(
+                f"[VERIFY-CODE-DEBUG] env={env_code!r} (len={len(env_code)}) "
+                f"submitted={code!r} (len={len(code)})",
+                flush=True,
+            )
             return Response({'error': 'Invalid registration code.'}, status=403)
 
         company = CompanySettings.objects.first()
