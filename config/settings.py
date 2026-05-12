@@ -10,6 +10,20 @@ ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*', cast=Csv())
 
 SITE_URL = config('SITE_URL', default='http://10.0.0.13:8000')
 
+# ── Proxy / SSL ───────────────────────────────────────────
+# Railway terminates TLS at its edge and forwards the request to gunicorn
+# as plain HTTP, setting X-Forwarded-Proto: https. Without this line,
+# Django thinks the request arrived as HTTP, which can cause spurious
+# 301 redirects that downgrade POST → GET (giving 405 Method Not Allowed
+# on every form submission). Trusting this header is safe BECAUSE
+# Railway's proxy strips client-supplied X-Forwarded-* headers before
+# forwarding, so the only source of this header is Railway itself.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+# Also tell Django that requests through the proxy CAN be considered
+# "secure" for purposes of CSRF same-origin checks etc.
+USE_X_FORWARDED_HOST = True
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
