@@ -7,7 +7,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.views.decorators.http import require_GET
 from rest_framework import status
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 import os
 import json
 from .models import Accountant, PayrollSendLog, DeliveryConfirmation
@@ -24,7 +24,8 @@ from .models import DriverLocation, PayrollSendLog, StopPhoto
 from .models import (
     CompanySettings, Manager, Driver, Truck,
     DailySchedule, Stop, Attendance, CraneSession,
-    Payroll, NotificationLog, Document
+    Payroll, NotificationLog, Document,
+    TrackingLink, StopTask,
 )
 from .serializers import AttendanceFixRequestSerializer
 from .serializers import (
@@ -778,6 +779,15 @@ class ClockInView(APIView):
             print(f"[CLOCK-IN] Serializer errors: {ser.errors}", flush=True)
             return Response(ser.errors, status=400)
 
+        # Auto-close any stale shift (>14h) belonging to this driver before
+        # checking for "already clocked in". Without this, a forgotten
+        # clock-out from days ago would lock the driver out forever.
+        try:
+            from .attendance_auto_close import close_stale_for_driver
+            close_stale_for_driver(request.driver)
+        except Exception as e:
+            print(f"[CLOCK-IN] auto-close check failed: {e}", flush=True)
+
         # Check if driver has ANY open shift (no midnight barrier)
         open_att = Attendance.objects.filter(
             driver=request.driver,
@@ -1136,11 +1146,30 @@ class DashboardStatsView(APIView):
 
 
 class DriverLocationUpdateView(APIView):
-    """Driver phone posts current GPS location while clocked in."""
+    """Driver phone posts current GPS location while clocked in.
+
+    DB hygiene: rows are only written when the driver has moved more
+    than MIN_DISTANCE_METERS OR more than HEARTBEAT_SECONDS has passed
+    since the last record. A parked truck no longer creates 120 rows/hour.
+    """
     permission_classes = [IsDriver]
+
+    # Tuning — kept here (not in CompanySettings) since they're network/DB
+    # hygiene concerns, not business rules. Tweak if needed.
+    MIN_DISTANCE_METERS = 20    # Below this, treat as "didn't move"
+    HEARTBEAT_SECONDS   = 300   # Always record at least once every 5 minutes
 
     def post(self, request):
         driver = request.driver
+
+        # Auto-close any stale shift (>14h) so we don't keep recording
+        # locations against a forgotten shift. After this, the find-open-
+        # shift query below correctly returns nothing for stale shifts.
+        try:
+            from .attendance_auto_close import close_stale_for_driver
+            close_stale_for_driver(driver)
+        except Exception as e:
+            print(f"[LOCATION] auto-close check failed: {e}", flush=True)
 
         # Find any open shift — no date filter (supports night shifts)
         attendance = Attendance.objects.filter(
@@ -1157,16 +1186,54 @@ class DriverLocationUpdateView(APIView):
 
         lat = request.data.get('latitude')
         lng = request.data.get('longitude')
-        loc = DriverLocation.objects.create(
-            driver=driver,
-            latitude=lat,
-            longitude=lng,
-            speed=request.data.get('speed'),
-            heading=request.data.get('heading'),
-            accuracy=request.data.get('accuracy'),
-        )
+
+        # ── Dedupe: skip DB write if driver hasn't moved meaningfully ──
+        # We still run arrival-detection below so geofence transitions
+        # within the 20m threshold still register.
+        from .geo_utils import haversine_meters
+        from datetime import timedelta
+
+        last = (DriverLocation.objects
+                .filter(driver=driver)
+                .order_by('-timestamp')
+                .first())
+        wrote_row = False
+        loc = last
+
+        should_write = True
+        if last is not None and lat is not None and lng is not None:
+            distance = haversine_meters(last.latitude, last.longitude, lat, lng)
+            age      = (timezone.now() - last.timestamp).total_seconds()
+            if distance < self.MIN_DISTANCE_METERS and age < self.HEARTBEAT_SECONDS:
+                should_write = False
+
+        if should_write:
+            loc = DriverLocation.objects.create(
+                driver=driver,
+                latitude=lat,
+                longitude=lng,
+                speed=request.data.get('speed'),
+                heading=request.data.get('heading'),
+                accuracy=request.data.get('accuracy'),
+            )
+            wrote_row = True
+
+        # Visible-in-log heartbeat — makes it possible to verify GPS is
+        # flowing without querying the DB. One line per POST regardless
+        # of whether we actually wrote a row.
+        try:
+            print(
+                f"[LOCATION] driver={driver.id} "
+                f"lat={lat} lng={lng} "
+                f"wrote={wrote_row}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
         # ── Auto-detect arrival at planned stops ──
+        # Run on every POST, even when we skipped the DB insert. A small
+        # movement within the 20m threshold can still cross a geofence.
         newly_arrived_ids = []
         if lat and lng:
             try:
@@ -1177,7 +1244,8 @@ class DriverLocationUpdateView(APIView):
 
         return Response({
             'ok': True,
-            'id': loc.id,
+            'id': loc.id if loc else None,
+            'wrote_row': wrote_row,
             'newly_arrived_stops': newly_arrived_ids,
         }, status=status.HTTP_201_CREATED)
 
@@ -1260,6 +1328,72 @@ class ActiveDriversLocationsView(APIView):
             })
 
         return Response(result)
+
+
+class NearestDriverView(APIView):
+    """Manager pastes a destination coord; we return all clocked-in drivers
+    ranked by straight-line distance to the destination.
+
+    POST /api/locations/nearest-driver/
+    Body: { "latitude": 32.7, "longitude": 35.3 }
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request):
+        from .geo_utils import haversine_meters
+
+        try:
+            dest_lat = float(request.data.get('latitude'))
+            dest_lng = float(request.data.get('longitude'))
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'latitude and longitude required (numeric)'},
+                status=400,
+            )
+
+        if not (-90 <= dest_lat <= 90 and -180 <= dest_lng <= 180):
+            return Response({'error': 'coordinates out of range'}, status=400)
+
+        # Find all clocked-in drivers
+        active_attendances = Attendance.objects.filter(
+            clock_in__isnull=False,
+            clock_out__isnull=True,
+        ).select_related('driver')
+
+        candidates = []
+        for att in active_attendances:
+            driver = att.driver
+            latest = (DriverLocation.objects
+                      .filter(driver=driver)
+                      .order_by('-timestamp')
+                      .first())
+            if not latest:
+                # Clocked in but never sent a location — skip
+                continue
+
+            dist_m = haversine_meters(
+                latest.latitude, latest.longitude,
+                dest_lat, dest_lng,
+            )
+            candidates.append({
+                'driver_id':   driver.id,
+                'driver_name': driver.full_name,
+                'lat':         float(latest.latitude),
+                'lng':         float(latest.longitude),
+                'last_seen':   latest.timestamp.isoformat(),
+                'distance_m':  round(dist_m, 1),
+                'distance_km': round(dist_m / 1000, 3),
+            })
+
+        # Sort closest first
+        candidates.sort(key=lambda c: c['distance_m'])
+
+        return Response({
+            'destination': {'lat': dest_lat, 'lng': dest_lng},
+            'count':       len(candidates),
+            'drivers':     candidates,
+        })
+
 
 class AccountantListCreateView(APIView):
     """GET list of accountants, POST to create."""
@@ -2077,3 +2211,767 @@ class UploadReleaseView(APIView):
         print(f"[RELEASE] version.json → {version}", flush=True)
         return Response({'ok': True, 'version': version, 'file': filename})
 
+
+
+"""
+Tracking views — add to core/views.py
+
+Also add to core/urls.py:
+    path('track/<str:token>/',        views.tracking_page),
+    path('api/track/<str:token>/data/', views.tracking_data),
+    path('api/tracking-links/',         views.TrackingLinkListCreateView.as_view()),
+    path('api/tracking-links/<int:pk>/revoke/', views.TrackingLinkRevokeView.as_view()),
+"""
+
+from django.http import HttpResponse, JsonResponse
+from django.views.decorators.http import require_GET
+
+
+"""
+Updated tracking_page view — replace tracking_page() in tracking_views.py
+Now includes:
+- ETA calculation
+- Client notes upload
+- Stop-specific tracking
+"""
+
+
+@require_GET
+def tracking_page(request, token):
+    try:
+        link = TrackingLink.objects.select_related(
+            'driver', 'target_stop'
+        ).get(token=token)
+    except TrackingLink.DoesNotExist:
+        return HttpResponse('<h2 style="color:#fff;font-family:sans-serif;text-align:center;margin-top:40px;">קישור לא נמצא</h2>', status=404)
+
+    if not link.is_valid():
+        return HttpResponse('''<html dir="rtl" style="background:#0a0a0a;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;"><div style="font-size:48px;">⏱</div><h2 style="color:#F5A623;">הקישור פג תוקף</h2><p style="color:#888;">פנה לחברה לקבלת קישור חדש</p></div></html>''', status=410)
+
+    from django.conf import settings
+    driver       = link.driver
+    site_url     = getattr(settings, 'SITE_URL', '').rstrip('/')
+    mapbox_token = getattr(settings, 'MAPBOX_TOKEN', '')
+    target_stop  = getattr(link, 'target_stop', None)
+    stop_id      = target_stop.id if target_stop else ''
+    stop_name    = target_stop.site_name if target_stop else ''
+
+    html = f'''<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0A0A0A">
+<title>מעקב משלוח — {stop_name or driver.full_name}</title>
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet">
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{background:#0A0A0A;color:#fff;font-family:-apple-system,sans-serif;min-height:100vh;display:flex;flex-direction:column;}}
+#header{{padding:14px 16px;background:#111;border-bottom:1px solid #1E1E1E;display:flex;align-items:center;gap:12px;}}
+#logo{{font-size:28px;}}
+#info h1{{font-size:16px;font-weight:700;}}
+#info p{{font-size:12px;color:#888;margin-top:2px;}}
+#map{{height:55vh;}}
+#eta-card{{background:#111;border-top:1px solid #1E1E1E;padding:16px;}}
+#eta-time{{font-size:28px;font-weight:800;color:#F5A623;font-family:monospace;}}
+#eta-label{{font-size:13px;color:#888;margin-bottom:4px;}}
+#eta-msg{{font-size:14px;color:#ccc;margin-top:6px;}}
+#notes-section{{background:#0D0D0D;padding:16px;flex:1;}}
+#notes-title{{font-size:14px;font-weight:700;color:#F5A623;margin-bottom:12px;}}
+.note-input{{width:100%;background:#1A1A1A;border:1px solid #2A2A2A;border-radius:10px;padding:12px;color:#fff;font-size:14px;font-family:inherit;resize:none;}}
+.note-input:focus{{outline:none;border-color:#F5A623;}}
+.phone-input{{width:100%;background:#1A1A1A;border:1px solid #2A2A2A;border-radius:10px;padding:12px;color:#fff;font-size:14px;font-family:inherit;margin-top:8px;}}
+.photo-label{{display:flex;align-items:center;gap:8px;background:#1A1A1A;border:1px dashed #333;border-radius:10px;padding:14px;margin-top:8px;cursor:pointer;color:#888;font-size:14px;}}
+.photo-label:hover{{border-color:#F5A623;color:#F5A623;}}
+#photo-preview{{width:100%;border-radius:10px;margin-top:8px;display:none;}}
+.send-btn{{width:100%;background:#F5A623;color:#000;border:none;border-radius:10px;padding:14px;font-size:16px;font-weight:800;margin-top:12px;cursor:pointer;}}
+.send-btn:hover{{background:#FFB74D;}}
+.send-btn:disabled{{opacity:0.5;cursor:not-allowed;}}
+#success{{display:none;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);border-radius:10px;padding:14px;text-align:center;color:#22C55E;font-weight:700;margin-top:12px;}}
+#powered{{text-align:center;font-size:11px;color:#333;padding:12px;}}
+.dot{{width:8px;height:8px;border-radius:50%;background:#22C55E;display:inline-block;margin-left:6px;animation:pulse 2s infinite;}}
+@keyframes pulse{{0%,100%{{opacity:1;}}50%{{opacity:0.3;}}}}
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div id="logo">🚛</div>
+  <div id="info">
+    <h1>{stop_name or 'מעקב משלוח'}</h1>
+    <p id="truck-sub">מחשב זמן הגעה...</p>
+  </div>
+  <span class="dot" style="margin-inline-start:auto;"></span>
+</div>
+
+<div id="map"></div>
+
+<div id="eta-card">
+  <div id="eta-label">זמן הגעה משוער</div>
+  <div id="eta-time">--:-- – --:--</div>
+  <div id="eta-msg">מחשב...</div>
+</div>
+
+<div id="notes-section">
+  <div id="notes-title">📝 השאר הערות לנהג</div>
+  <textarea class="note-input" id="note-text" rows="3" placeholder="לדוגמה: אזור פריקה בכניסה הצדדית, קוד שער 1234..."></textarea>
+  <input class="phone-input" id="phone-input" type="tel" placeholder="מספר טלפון ליצירת קשר (אופציונלי)">
+  <label class="photo-label" for="photo-file">
+    📸 הוסף תמונה (אזור פריקה, מיקום הרכב...)
+  </label>
+  <input type="file" id="photo-file" accept="image/*" style="display:none" onchange="previewPhoto(this)">
+  <img id="photo-preview" alt="תצוגה מקדימה">
+  <button class="send-btn" id="send-btn" onclick="sendNote()">שלח לנהג ✓</button>
+  <div id="success">✓ ההערה נשלחה לנהג!</div>
+</div>
+
+<div id="powered">Powered by TruckForce</div>
+
+<script>
+const TOKEN    = '{token}';
+const SITE     = '{site_url}';
+const STOP_ID  = '{stop_id}';
+const MAPBOX   = '{mapbox_token}';
+
+mapboxgl.accessToken = MAPBOX;
+const map = new mapboxgl.Map({{
+  container: 'map',
+  style: 'mapbox://styles/mapbox/dark-v11',
+  center: [34.85, 31.85],
+  zoom: 11,
+  attributionControl: false,
+}});
+
+// Truck marker
+const el = document.createElement('div');
+el.innerHTML = '🚛';
+el.style.cssText = 'font-size:30px;filter:drop-shadow(0 0 10px rgba(245,166,35,0.7))';
+const marker = new mapboxgl.Marker(el).setLngLat([34.85,31.85]).addTo(map);
+
+let firstLoad = true;
+
+async function updateLocation() {{
+  try {{
+    const res  = await fetch(`${{SITE}}/api/track/${{TOKEN}}/data/`);
+    const data = await res.json();
+    if (!data.location) return;
+    const {{lat, lng}} = data.location;
+    marker.setLngLat([lng, lat]);
+    if (firstLoad) {{
+      map.flyTo({{center:[lng,lat], zoom:13, duration:1500}});
+      firstLoad = false;
+    }}
+    if (data.truck) document.getElementById('truck-sub').textContent = data.truck;
+  }} catch(e) {{ console.error(e); }}
+}}
+
+async function updateETA() {{
+  if (!STOP_ID) return;
+  try {{
+    const res  = await fetch(`${{SITE}}/api/track/${{TOKEN}}/eta/?stop_id=${{STOP_ID}}`);
+    const data = await res.json();
+    if (data.eta_min_time && data.eta_max_time) {{
+      document.getElementById('eta-time').textContent = `${{data.eta_min_time}} – ${{data.eta_max_time}}`;
+      document.getElementById('eta-msg').textContent  = data.message || '';
+    }} else {{
+      document.getElementById('eta-msg').textContent = 'ממתין למיקום הנהג...';
+    }}
+  }} catch(e) {{ console.error(e); }}
+}}
+
+function previewPhoto(input) {{
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {{
+    const img = document.getElementById('photo-preview');
+    img.src   = e.target.result;
+    img.style.display = 'block';
+  }};
+  reader.readAsDataURL(file);
+}}
+
+async function sendNote() {{
+  const note  = document.getElementById('note-text').value.trim();
+  const phone = document.getElementById('phone-input').value.trim();
+  const photo = document.getElementById('photo-file').files[0];
+  if (!note && !photo) return alert('אנא הוסף הערה או תמונה');
+
+  const btn = document.getElementById('send-btn');
+  btn.disabled    = true;
+  btn.textContent = 'שולח...';
+
+  const fd = new FormData();
+  fd.append('stop_id', STOP_ID);
+  if (note)  fd.append('note',  note);
+  if (phone) fd.append('phone', phone);
+  if (photo) fd.append('photo', photo);
+
+  try {{
+    const res = await fetch(`${{SITE}}/api/track/${{TOKEN}}/client-note/`, {{
+      method: 'POST', body: fd
+    }});
+    if (res.ok) {{
+      document.getElementById('success').style.display = 'block';
+      document.getElementById('note-text').value  = '';
+      document.getElementById('phone-input').value = '';
+      document.getElementById('photo-file').value  = '';
+      document.getElementById('photo-preview').style.display = 'none';
+      btn.textContent = '✓ נשלח';
+    }} else {{
+      btn.disabled    = false;
+      btn.textContent = 'שלח לנהג ✓';
+      alert('שגיאה בשליחה, נסה שוב');
+    }}
+  }} catch(e) {{
+    btn.disabled    = false;
+    btn.textContent = 'שלח לנהג ✓';
+  }}
+}}
+
+updateLocation();
+updateETA();
+setInterval(updateLocation, 30000);
+setInterval(updateETA,      60000);
+</script>
+</body>
+</html>'''
+    return HttpResponse(html, content_type='text/html; charset=utf-8')
+
+
+@require_GET
+def tracking_data(request, token):
+    """
+    Returns JSON with driver's current location + stop info.
+    No auth required — public endpoint for the tracking page.
+    """
+    try:
+        link = TrackingLink.objects.select_related('driver').get(token=token)
+    except TrackingLink.DoesNotExist:
+        return JsonResponse({'error': 'Not found'}, status=404)
+
+    if not link.is_valid():
+        return JsonResponse({'error': 'Expired'}, status=410)
+
+    driver = link.driver
+    today  = localdate()
+
+    # Latest location
+    latest = DriverLocation.objects.filter(driver=driver).first()
+
+    # Today's schedule
+    try:
+        schedule = DailySchedule.objects.get(driver=driver, date=today)
+        truck = f"{schedule.truck.brand} {schedule.truck.model} · {schedule.truck.plate_number}" if schedule.truck else None
+        # Current pending stop
+        current_stop = schedule.stops.filter(status='pending').order_by('order').first()
+        stop_data = {
+            'site_name': current_stop.site_name,
+            'address':   current_stop.address,
+            'order':     current_stop.order,
+        } if current_stop else None
+    except DailySchedule.DoesNotExist:
+        truck     = None
+        stop_data = None
+
+    return JsonResponse({
+        'driver': driver.full_name,
+        'truck':  truck,
+        'location': {
+            'lat':       float(latest.latitude),
+            'lng':       float(latest.longitude),
+            'timestamp': latest.timestamp.isoformat(),
+        } if latest else None,
+        'current_stop': stop_data,
+        'label': link.label,
+    })
+
+
+def _build_tracking_url(request, token: str) -> str:
+    """
+    Build the public URL a manager can share with a client.
+
+    Prefers settings.SITE_URL — that's what gets set on Railway/production
+    and matches the host that's actually reachable from the public internet.
+    Falls back to request.build_absolute_uri so dev/runserver still works
+    when SITE_URL isn't set in .env.
+
+    Returns e.g. "https://truckforce-production.up.railway.app/track/abc.../"
+    """
+    from django.conf import settings
+    base = (getattr(settings, 'SITE_URL', '') or '').rstrip('/')
+    if not base:
+        base = request.build_absolute_uri('/')[:-1]
+    return f"{base}/track/{token}/"
+
+
+class TrackingLinkListCreateView(APIView):
+    """Manager creates and views tracking links."""
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        links = TrackingLink.objects.filter(
+            created_by=request.manager
+        ).select_related('driver')
+        data = [{
+            'id':         l.id,
+            'token':      l.token,
+            'driver':     l.driver.full_name,
+            'driver_id':  l.driver.id,
+            'label':      l.label,
+            'is_active':  l.is_active,
+            'is_valid':   l.is_valid(),
+            'expires_at': l.expires_at.isoformat() if l.expires_at else None,
+            'created_at': l.created_at.isoformat(),
+            'url':        _build_tracking_url(request, l.token),
+        } for l in links]
+        return Response(data)
+
+    def post(self, request):
+        driver_id = request.data.get('driver_id')
+        label     = request.data.get('label', '')
+        hours     = int(request.data.get('hours', 24))
+
+        try:
+            driver = Driver.objects.get(pk=driver_id)
+        except Driver.DoesNotExist:
+            return Response({'error': 'Driver not found'}, status=404)
+
+        link = TrackingLink.generate(
+            driver=driver,
+            manager=request.manager,
+            label=label,
+            hours=hours,
+        )
+        url = _build_tracking_url(request, link.token)
+        return Response({'ok': True, 'token': link.token, 'url': url}, status=201)
+
+
+class TrackingLinkRevokeView(APIView):
+    """Manager revokes a tracking link."""
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        try:
+            link = TrackingLink.objects.get(pk=pk, created_by=request.manager)
+            link.is_active = False
+            link.save()
+            return Response({'ok': True})
+        except TrackingLink.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+
+
+
+
+from django.utils import timezone as tz
+
+
+class OptimizeRouteView(APIView):
+    """
+    POST /api/schedules/<pk>/optimize/
+    Manager clicks "מסלול אופטימלי" — system calculates best stop order.
+    Saves suggestion, notifies driver via Firebase.
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        try:
+            schedule = DailySchedule.objects.prefetch_related('stops').get(pk=pk)
+        except DailySchedule.DoesNotExist:
+            return Response({'error': 'Schedule not found'}, status=404)
+
+        stops = list(schedule.stops.filter(status='pending').order_by('order'))
+        if not stops:
+            return Response({'error': 'No pending stops to optimize'}, status=400)
+
+        # Get driver's current location
+        driver   = schedule.driver
+        latest   = DriverLocation.objects.filter(driver=driver).first()
+
+        if latest:
+            driver_lat = float(latest.latitude)
+            driver_lng = float(latest.longitude)
+        else:
+            # Fallback: use first stop as starting point
+            first = stops[0]
+            driver_lat = float(first.latitude) if first.latitude else 31.85
+            driver_lng = float(first.longitude) if first.longitude else 34.85
+
+        # Run optimization
+        from .route_optimizer import optimize_route
+        result = optimize_route(driver_lat, driver_lng, stops)
+
+        if result.get('error') and not result.get('ordered_stop_ids'):
+            return Response({'error': result['error']}, status=500)
+
+        # Save suggestion to schedule
+        schedule.route_suggestion = {
+            'ordered_stop_ids':      result.get('ordered_stop_ids', []),
+            'durations':             result.get('durations', []),
+            'total_duration_minutes': result.get('total_duration_minutes', 0),
+            'geometry':              result.get('geometry'),
+            'driver_lat':            driver_lat,
+            'driver_lng':            driver_lng,
+            'created_at':            tz.now().isoformat(),
+        }
+        schedule.route_optimized    = True
+        schedule.route_optimized_at = tz.now()
+        schedule.save()
+
+        # Notify driver via Firebase
+        publish_event('route_suggestion', by_user_id=getattr(request.manager, 'id', None), extra={
+            'schedule_id':           pk,
+            'driver_id':             driver.id,
+            'total_duration_minutes': result.get('total_duration_minutes', 0),
+            'stop_count':            len(stops),
+        })
+
+        print(f"[ROUTE] Optimized schedule {pk} — {len(stops)} stops, "
+              f"{result.get('total_duration_minutes', 0)} min", flush=True)
+
+        return Response({
+            'ok':                    True,
+            'ordered_stop_ids':      result.get('ordered_stop_ids', []),
+            'durations':             result.get('durations', []),
+            'total_duration_minutes': result.get('total_duration_minutes', 0),
+            'geometry':              result.get('geometry'),
+            'method':                result.get('method', 'mapbox'),
+        })
+
+
+class ApplyRouteSuggestionView(APIView):
+    """
+    POST /api/schedules/<pk>/apply-suggestion/
+    Manager approves the suggestion — reorders stops in DB.
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        try:
+            schedule = DailySchedule.objects.get(pk=pk)
+        except DailySchedule.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        suggestion = schedule.route_suggestion
+        if not suggestion:
+            return Response({'error': 'No suggestion available'}, status=400)
+
+        ordered_ids = suggestion.get('ordered_stop_ids', [])
+        if not ordered_ids:
+            return Response({'error': 'Empty suggestion'}, status=400)
+
+        # Reorder stops
+        for new_order, stop_id in enumerate(ordered_ids, start=1):
+            Stop.objects.filter(pk=stop_id, schedule=schedule).update(order=new_order)
+
+        # Notify driver route is confirmed
+        publish_event('route_confirmed', by_user_id=getattr(request.manager, 'id', None), extra={
+            'schedule_id': pk,
+            'driver_id':   schedule.driver.id,
+        })
+
+        return Response({'ok': True, 'message': 'Route applied and driver notified'})
+
+
+class StopTaskListCreateView(APIView):
+    """
+    GET/POST /api/stops/<pk>/tasks/
+    Manager adds notes/tasks for a stop — driver sees them on phone.
+    """
+    permission_classes = [IsManagerOrDriver]
+    parser_classes     = [MultiPartParser, FormParser, JSONParser]
+
+    def get(self, request, pk):
+        tasks = StopTask.objects.filter(stop_id=pk)
+        data  = [{
+            'id':         t.id,
+            'source':     t.source,
+            'note':       t.note,
+            'phone':      t.phone,
+            'photo':      request.build_absolute_uri(t.photo.url) if t.photo else None,
+            'created_at': t.created_at.isoformat(),
+        } for t in tasks]
+        return Response(data)
+
+    def post(self, request, pk):
+        try:
+            stop = Stop.objects.get(pk=pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Stop not found'}, status=404)
+
+        source = 'manager' if hasattr(request, 'manager') and request.manager else 'driver'
+
+        task = StopTask.objects.create(
+            stop   = stop,
+            source = source,
+            note   = request.data.get('note', ''),
+            phone  = request.data.get('phone', ''),
+            photo  = request.FILES.get('photo'),
+        )
+
+        return Response({
+            'id':         task.id,
+            'source':     task.source,
+            'note':       task.note,
+            'phone':      task.phone,
+            'photo':      request.build_absolute_uri(task.photo.url) if task.photo else None,
+            'created_at': task.created_at.isoformat(),
+        }, status=201)
+
+
+class StopTaskDeleteView(APIView):
+    """DELETE /api/stop-tasks/<pk>/"""
+    permission_classes = [IsManager]
+
+    def delete(self, request, pk):
+        StopTask.objects.filter(pk=pk).delete()
+        return Response({'ok': True})
+
+
+class ClientNoteView(APIView):
+    """
+    POST /api/track/<token>/client-note/
+    Client uploads note/photo via tracking link — driver sees it.
+    No auth required.
+    """
+    permission_classes = []
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def post(self, request, token):
+        try:
+            link = TrackingLink.objects.get(token=token)
+        except TrackingLink.DoesNotExist:
+            return Response({'error': 'Link not found'}, status=404)
+
+        if not link.is_valid():
+            return Response({'error': 'Link expired'}, status=410)
+
+        stop_id = request.data.get('stop_id')
+        if not stop_id:
+            return Response({'error': 'stop_id required'}, status=400)
+
+        try:
+            stop = Stop.objects.get(pk=stop_id)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Stop not found'}, status=404)
+
+        task = StopTask.objects.create(
+            stop   = stop,
+            source = 'client',
+            note   = request.data.get('note', ''),
+            phone  = request.data.get('phone', ''),
+            photo  = request.FILES.get('photo'),
+        )
+
+        # Notify driver via Firebase
+        publish_event('client_note_added', extra={
+            'stop_id':   stop.id,
+            'stop_name': stop.site_name,
+            'driver_id': stop.schedule.driver.id,
+        })
+
+        return Response({'ok': True, 'task_id': task.id}, status=201)
+
+
+class RouteETAView(APIView):
+    """
+    GET /api/track/<token>/eta/?stop_id=<id>
+    Returns ETA for a specific stop via tracking link.
+    No auth required.
+    """
+    permission_classes = []
+
+    def get(self, request, token):
+        try:
+            link = TrackingLink.objects.get(token=token)
+        except TrackingLink.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        if not link.is_valid():
+            return Response({'error': 'Expired'}, status=410)
+
+        stop_id = request.query_params.get('stop_id')
+        driver  = link.driver
+        today   = localdate()
+
+        # Get driver location
+        latest = DriverLocation.objects.filter(driver=driver).first()
+        if not latest:
+            return Response({'eta_min': None, 'eta_max': None, 'no_location': True})
+
+        # Get pending stops
+        try:
+            schedule = DailySchedule.objects.get(driver=driver, date=today)
+            stops_ahead = list(schedule.stops.filter(status='pending').order_by('order'))
+        except DailySchedule.DoesNotExist:
+            return Response({'eta_min': None, 'eta_max': None})
+
+        from .route_optimizer import calculate_eta
+        min_eta, max_eta = calculate_eta(
+            float(latest.latitude), float(latest.longitude),
+            stops_ahead, int(stop_id)
+        )
+
+        now = tz.now()
+        from datetime import timedelta
+        eta_min_time = (now + timedelta(minutes=min_eta)).strftime('%H:%M')
+        eta_max_time = (now + timedelta(minutes=max_eta)).strftime('%H:%M')
+
+        return Response({
+            'eta_min_minutes': min_eta,
+            'eta_max_minutes': max_eta,
+            'eta_min_time':    eta_min_time,
+            'eta_max_time':    eta_max_time,
+            'message':         f'הנהג יגיע בין {eta_min_time} ל-{eta_max_time}',
+        })
+
+
+class StopCompleteView(APIView):
+    """
+    POST /api/stops/<pk>/complete/
+    Driver marks stop as done with optional note and photo.
+    More detailed than the simple update — handles pickup/delivery logic.
+    """
+    permission_classes = [IsManagerOrDriver]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request, pk):
+        try:
+            stop = Stop.objects.select_related('schedule__driver').get(pk=pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Stop not found'}, status=404)
+
+        action = request.data.get('action', 'done')  # 'done' or 'skipped'
+        driver_note = request.data.get('driver_note', '')
+        photo = request.FILES.get('photo')
+        skip_reason = request.data.get('skip_reason', '')
+
+        stop.status = action
+        stop.driver_note = driver_note
+        stop.completed_at = timezone.now()
+
+        if skip_reason:
+            stop.skip_reason = skip_reason
+
+        stop.save()
+
+        # Photo (if any) goes via the StopPhoto FK — Stop has no direct photo field.
+        if photo:
+            StopPhoto.objects.create(stop=stop, image=photo)
+
+        # Log based on stop type
+        type_label = dict(Stop.STOP_TYPE_CHOICES).get(stop.stop_type, stop.stop_type)
+        print(f"[STOP] #{stop.order} {type_label} '{stop.site_name}' → {action} "
+              f"(driver: {stop.schedule.driver.full_name})", flush=True)
+
+        # Notify office via Firebase
+        publish_event('stop_updated', extra={
+            'stop_id': stop.id,
+            'stop_name': stop.site_name,
+            'stop_type': stop.stop_type,
+            'status': action,
+            'driver_id': stop.schedule.driver.id,
+            'order': stop.order,
+        })
+
+        return Response({
+            'ok': True,
+            'stop_id': stop.id,
+            'status': stop.status,
+            'stop_type': stop.stop_type,
+            'completed_at': stop.completed_at.isoformat(),
+        })
+
+
+class ScheduleSummaryView(APIView):
+    """
+    GET /api/schedules/<pk>/summary/
+    Returns a full summary of the schedule — all stops with their
+    pickup/delivery relationships. Used by office and driver.
+    """
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request, pk):
+        try:
+            schedule = DailySchedule.objects.prefetch_related(
+                'stops', 'stops__tasks', 'stops__delivery_stops'
+            ).select_related('driver', 'truck').get(pk=pk)
+        except DailySchedule.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        stops_data = []
+        for stop in schedule.stops.order_by('order'):
+            # Get linked deliveries if this is a pickup
+            linked_deliveries = []
+            if stop.stop_type in ('pickup', 'both'):
+                for d in stop.delivery_stops.all():
+                    linked_deliveries.append({
+                        'id': d.id,
+                        'order': d.order,
+                        'site_name': d.site_name,
+                        'status': d.status,
+                        'items': d.items,
+                    })
+
+            # Tasks for this stop
+            tasks = [{
+                'id': t.id,
+                'source': t.source,
+                'note': t.note,
+                'phone': t.phone,
+                'photo': request.build_absolute_uri(t.photo.url) if t.photo else None,
+            } for t in stop.tasks.all()]
+
+            stops_data.append({
+                'id': stop.id,
+                'order': stop.order,
+                'stop_type': stop.stop_type,
+                'stop_type_label': dict([
+                    ('delivery', 'מסירה'),
+                    ('pickup', 'איסוף'),
+                    ('service', 'שירות'),
+                    ('both', 'איסוף + מסירה'),
+                ]).get(stop.stop_type, stop.stop_type),
+                'site_name': stop.site_name,
+                'address': stop.address,
+                'latitude': float(stop.latitude) if stop.latitude else None,
+                'longitude': float(stop.longitude) if stop.longitude else None,
+                'notes': stop.notes,
+                'items': stop.items,
+                'contact_name': stop.contact_name,
+                'contact_phone': stop.contact_phone,
+                'status': stop.status,
+                'driver_note': stop.driver_note,
+                'skip_reason': stop.skip_reason,
+                'completed_at': stop.completed_at.isoformat() if stop.completed_at else None,
+                'pickup_stop_id': stop.pickup_stop_id,
+                'linked_deliveries': linked_deliveries,
+                'tasks': tasks,
+                'expected_arrival': str(stop.expected_arrival) if stop.expected_arrival else None,
+            })
+
+        # Stats
+        total = len(stops_data)
+        done = sum(1 for s in stops_data if s['status'] == 'done')
+        pickups = sum(1 for s in stops_data if s['stop_type'] in ('pickup', 'both'))
+        deliveries = sum(1 for s in stops_data if s['stop_type'] in ('delivery', 'both'))
+
+        return Response({
+            'id': schedule.id,
+            'date': str(schedule.date),
+            'driver': schedule.driver.full_name,
+            'truck': f"{schedule.truck.brand} {schedule.truck.plate_number}" if schedule.truck else None,
+            'status': schedule.status,
+            'stats': {
+                'total': total,
+                'done': done,
+                'pickups': pickups,
+                'deliveries': deliveries,
+                'completion': f"{round(done / total * 100)}%" if total else '0%',
+            },
+            'stops': stops_data,
+            'manager_notes': schedule.manager_notes if hasattr(schedule, 'manager_notes') else '',
+            'route_optimized': getattr(schedule, 'route_optimized', False),
+        })
