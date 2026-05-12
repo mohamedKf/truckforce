@@ -184,6 +184,11 @@ class StopSerializer(serializers.ModelSerializer):
             'expected_arrival', 'actual_arrival', 'allow_driver_reorder',
             'photos', 'is_late',
             'notes', 'status', 'completed_at', 'skip_reason',
+            # ── Stop-type / pickup-delivery linkage ──
+            'stop_type', 'items',
+            'contact_name', 'contact_phone',
+            'pickup_stop',
+            'driver_note',
         ]
         read_only_fields = ['completed_at', 'actual_arrival']
 
@@ -192,7 +197,7 @@ class StopUpdateSerializer(serializers.ModelSerializer):
     """Driver uses this to mark stop done/skipped."""
     class Meta:
         model  = Stop
-        fields = ['status', 'skip_reason', 'completed_at', 'actual_arrival']
+        fields = ['status', 'skip_reason', 'completed_at', 'actual_arrival', 'driver_note']
 
 
 # ──────────────────────────────────────────────
@@ -213,8 +218,11 @@ class DailyScheduleSerializer(serializers.ModelSerializer):
             'date', 'status', 'manager_notes', 'created_by',
             'missed_stops_count', 'completion_percent',
             'stops', 'created_at',
+            # ── Route optimization ──
+            'route_optimized', 'route_optimized_at', 'route_suggestion',
+            'driver_notified',
         ]
-        read_only_fields = ['created_at']
+        read_only_fields = ['created_at', 'route_optimized_at']
 
 
 class StopCreateNestedSerializer(serializers.ModelSerializer):
@@ -225,14 +233,25 @@ class StopCreateNestedSerializer(serializers.ModelSerializer):
             'order', 'site_name', 'address',
             'latitude', 'longitude',
             'expected_arrival', 'notes',
+            'allow_driver_reorder',
+            # ── Stop-type / pickup-delivery linkage ──
+            'stop_type', 'items',
+            'contact_name', 'contact_phone',
+            'pickup_stop',
         ]
         extra_kwargs = {
-            'order':     {'required': False},
-            'address':   {'required': False, 'allow_blank': True},
-            'notes':     {'required': False, 'allow_blank': True},
-            'latitude':  {'required': False, 'allow_null': True},
-            'longitude': {'required': False, 'allow_null': True},
-            'expected_arrival': {'required': False, 'allow_null': True},
+            'order':                {'required': False},
+            'address':              {'required': False, 'allow_blank': True},
+            'notes':                {'required': False, 'allow_blank': True},
+            'latitude':             {'required': False, 'allow_null': True},
+            'longitude':            {'required': False, 'allow_null': True},
+            'expected_arrival':     {'required': False, 'allow_null': True},
+            'allow_driver_reorder': {'required': False},
+            'stop_type':            {'required': False},
+            'items':                {'required': False, 'allow_blank': True},
+            'contact_name':         {'required': False, 'allow_blank': True},
+            'contact_phone':        {'required': False, 'allow_blank': True},
+            'pickup_stop':          {'required': False, 'allow_null': True},
         }
 
 
@@ -269,6 +288,7 @@ class AttendanceSerializer(serializers.ModelSerializer):
             'clock_in_lat', 'clock_in_lng',
             'clock_out_lat', 'clock_out_lng',
             'notes', 'edited_by', 'total_hours',
+            'auto_closed',
         ]
 
 

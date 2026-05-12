@@ -10,6 +10,7 @@ urlpatterns = [
     path('auth/manager/register/',        views.ManagerRegisterView.as_view()),
     path('auth/driver/login/',            views.DriverLoginView.as_view()),
     path('auth/driver/logout/',           views.DriverLogoutView.as_view()),
+    path('auth/driver/change-password/',  views.DriverChangePasswordView.as_view()),
 
     # ── Company Settings ──────────────────────────────
     path('settings/',                     views.CompanySettingsView.as_view()),
@@ -19,34 +20,53 @@ urlpatterns = [
     path('managers/<int:pk>/',            views.ManagerDetailView.as_view()),
 
     # ── Drivers — specific before <int:pk> ────────────
-    path('drivers/',                      views.DriverListCreateView.as_view()),
-    path('drivers/fcm/',                  views.DriverUpdateFCMView.as_view()),
-    path('drivers/<int:pk>/',             views.DriverDetailView.as_view()),
+    path('drivers/',                          views.DriverListCreateView.as_view()),
+    path('drivers/fcm/',                      views.DriverUpdateFCMView.as_view()),
+    path('drivers/active-locations/',         views.ActiveDriversLocationsView.as_view()),
+    path('drivers/<int:driver_id>/children/', views.DriverChildrenView.as_view()),
+    path('driver/photo/',                     views.DriverPhotoUploadView.as_view()),  # driver uploads own photo (uses token, no pk)
+    path('drivers/<int:pk>/photo/clear-b64/', views.DriverPhotoClearB64View.as_view()),
+    path('drivers/<int:pk>/ping/',            views.DriverPingView.as_view()),
+    path('drivers/<int:pk>/',                 views.DriverDetailView.as_view()),
+
+    # ── Driver children ───────────────────────────────
+    path('children/<int:pk>/',            views.ChildDetailView.as_view()),
 
     # ── Trucks ────────────────────────────────────────
     path('trucks/',                       views.TruckListCreateView.as_view()),
     path('trucks/<int:pk>/',              views.TruckDetailView.as_view()),
 
     # ── Schedules — specific before <int:pk> ──────────
-    path('schedules/',                    views.ScheduleListCreateView.as_view()),
-    path('schedules/today/',              views.DriverTodayScheduleView.as_view()),
-    path('schedules/by-date/<str:date>/',  views.DriverScheduleByDateView.as_view()),
-    path('schedules/<int:pk>/reorder-stops/', views.DriverReorderStopsView.as_view()),
-    path('schedules/<int:pk>/',           views.ScheduleDetailView.as_view()),
+    path('schedules/',                                  views.ScheduleListCreateView.as_view()),
+    path('schedules/today/',                            views.DriverTodayScheduleView.as_view()),
+    path('schedules/by-date/<str:date>/',               views.DriverScheduleByDateView.as_view()),
+    path('schedules/<int:pk>/reorder-stops/',           views.DriverReorderStopsView.as_view()),
+    path('schedules/<int:pk>/optimize/',                views.OptimizeRouteView.as_view()),
+    path('schedules/<int:pk>/apply-suggestion/',        views.ApplyRouteSuggestionView.as_view()),
+    path('schedules/<int:pk>/summary/',                 views.ScheduleSummaryView.as_view()),
+    path('schedules/<int:schedule_id>/stops/',          views.ScheduleStopsAddView.as_view()),
+    path('schedules/<int:pk>/',                         views.ScheduleDetailView.as_view()),
 
     # ── Stops ─────────────────────────────────────────
-    path('stops/<int:stop_id>/sign/',             views.StopSignatureView.as_view()),
-    path('stops/<int:pk>/update/',                views.StopUpdateView.as_view()),     # driver: status/skip
-    path('stops/<int:pk>/',                       views.StopDetailView.as_view()),     # manager: edit/delete
-    path('schedules/<int:schedule_id>/stops/',    views.ScheduleStopsAddView.as_view()), # manager: add stop
-    path('stops/<int:stop_id>/photos/',           views.StopPhotoListCreateView.as_view()),
-    path('stop-photos/<int:pk>/',                 views.StopPhotoDeleteView.as_view()),
+    path('stops/<int:pk>/update/',        views.StopUpdateView.as_view()),       # driver: status/skip
+    path('stops/<int:pk>/complete/',      views.StopCompleteView.as_view()),     # driver: detailed done/skipped
+    path('stops/<int:stop_id>/signature/', views.StopSignatureView.as_view()),    # driver: signature → DeliveryConfirmation
+    path('stops/<int:stop_id>/sign/',      views.StopSignatureView.as_view()),    # alias: legacy mobile builds use /sign/
+    path('stops/<int:pk>/tasks/',         views.StopTaskListCreateView.as_view()),  # GET/POST tasks
+    path('stops/<int:stop_id>/photos/',   views.StopPhotoListCreateView.as_view()),
+    path('stops/<int:pk>/',               views.StopDetailView.as_view()),       # manager: edit/delete
+    path('stop-photos/<int:pk>/',         views.StopPhotoDeleteView.as_view()),
+    path('stop-tasks/<int:pk>/',          views.StopTaskDeleteView.as_view()),
 
     # ── Attendance — specific before <int:pk> ─────────
     path('attendance/',                   views.AttendanceListView.as_view()),
     path('attendance/clock-in/',          views.ClockInView.as_view()),
     path('attendance/clock-out/',         views.ClockOutView.as_view()),
     path('attendance/<int:pk>/',          views.AttendanceDetailView.as_view()),
+
+    # ── Attendance fix requests ───────────────────────
+    path('attendance-fix-requests/',                 views.AttendanceFixRequestListCreateView.as_view()),
+    path('attendance-fix-requests/<int:pk>/decide/', views.AttendanceFixRequestDecideView.as_view()),
 
     # ── Crane — specific before <int:pk> ──────────────
     path('crane/',                        views.CraneSessionListView.as_view()),
@@ -58,6 +78,21 @@ urlpatterns = [
     path('payroll/generate/',             views.PayrollGenerateView.as_view()),
     path('payroll/<int:pk>/',             views.PayrollDetailView.as_view()),
 
+    # ── Payroll send log ──────────────────────────────
+    path('payroll-sends/',                views.PayrollSendLogListView.as_view()),
+
+    # ── Payroll config (singleton) ────────────────────
+    path('payroll-config/',               views.PayrollConfigView.as_view()),
+
+    # ── Payslips ──────────────────────────────────────
+    path('payslips/',                     views.PayslipListView.as_view()),
+    path('payslips/generate/',            views.PayslipGenerateView.as_view()),
+    path('payslips/<int:pk>/',            views.PayslipDetailView.as_view()),
+
+    # ── Accountants ───────────────────────────────────
+    path('accountants/',                  views.AccountantListCreateView.as_view()),
+    path('accountants/<int:pk>/',         views.AccountantDetailView.as_view()),
+
     # ── Notifications ─────────────────────────────────
     path('notifications/',                views.NotificationListView.as_view()),
 
@@ -68,41 +103,21 @@ urlpatterns = [
     # ── Dashboard ─────────────────────────────────────
     path('dashboard/',                    views.DashboardStatsView.as_view()),
 
-    # ── Live tracking ─────────────────────────────────
-    path('driver/location/', views.DriverLocationUpdateView.as_view()),
-    path('drivers/active-locations/', views.ActiveDriversLocationsView.as_view()),
+    # ── Live tracking (driver GPS feed) ───────────────
+    path('driver/location/',              views.DriverLocationUpdateView.as_view()),
+    path('locations/nearest-driver/',     views.NearestDriverView.as_view()),
 
-    path('accountants/', views.AccountantListCreateView.as_view()),
-    path('accountants/<int:pk>/', views.AccountantDetailView.as_view()),
+    # ── Public tracking links (client-facing) ─────────
+    # NOTE: tracking_page (HTML) is served from /track/<token>/ at the project urls.py
+    # level — see truckforce_backend/urls.py. The API endpoints below live under /api/.
+    path('tracking-links/',                  views.TrackingLinkListCreateView.as_view()),
+    path('tracking-links/<int:pk>/revoke/',  views.TrackingLinkRevokeView.as_view()),
+    path('track/<str:token>/data/',          views.tracking_data),
+    path('track/<str:token>/eta/',           views.RouteETAView.as_view()),
+    path('track/<str:token>/client-note/',   views.ClientNoteView.as_view()),
 
-    # ── Payroll send log ──────────────────────────────
-    path('payroll-sends/', views.PayrollSendLogListView.as_view()),
-
-    # ── Payroll config (singleton) ────────────────────
-    path('payroll-config/', views.PayrollConfigView.as_view()),
-
-    # ── Driver children ───────────────────────────────
-    path('drivers/<int:driver_id>/children/', views.DriverChildrenView.as_view()),
-    path('children/<int:pk>/', views.ChildDetailView.as_view()),
-
-    # ── Payslips ──────────────────────────────────────
-    path('payslips/', views.PayslipListView.as_view()),
-    path('payslips/generate/', views.PayslipGenerateView.as_view()),
-    path('payslips/<int:pk>/', views.PayslipDetailView.as_view()),
-    # ── Attendance fix requests ──
-    path('attendance-fix-requests/',                views.AttendanceFixRequestListCreateView.as_view()),
-    path('attendance-fix-requests/<int:pk>/decide/', views.AttendanceFixRequestDecideView.as_view()),
-
-    # ── Driver password change ──
-    path('auth/driver/change-password/',            views.DriverChangePasswordView.as_view()),
-    path('driver/photo/',                           views.DriverPhotoUploadView.as_view()),
-    path('drivers/<int:pk>/clear-photo-b64/',       views.DriverPhotoClearB64View.as_view()),
-
-    path('drivers/<int:pk>/ping/', views.DriverPingView.as_view()),
-
-    path('version/',                  views.app_version),
-    path('upload-release/',           views.UploadReleaseView.as_view()),
-    path('downloads/<str:filename>',  views.download_release),
-
-
+    # ── Desktop auto-updater ──────────────────────────
+    path('version/',                      views.app_version),
+    path('downloads/<str:filename>',      views.download_release),
+    path('upload-release/',               views.UploadReleaseView.as_view()),
 ]

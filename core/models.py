@@ -212,6 +212,14 @@ class DailySchedule(models.Model):
     created_by  = models.ForeignKey(Manager, on_delete=models.SET_NULL, null=True, blank=True)
     created_at  = models.DateTimeField(auto_now_add=True)
 
+    # ── Route optimization ─────────────────────────────────
+    route_optimized    = models.BooleanField(default=False)
+    route_optimized_at = models.DateTimeField(null=True, blank=True)
+    route_suggestion   = models.JSONField(null=True, blank=True,
+                            help_text='Mapbox suggested stop order + durations + geometry')
+    driver_notified    = models.BooleanField(default=False,
+                            help_text='True once driver has been pushed the optimized route')
+
     class Meta:
         unique_together = ('driver', 'date')
         ordering = ['-date']
@@ -239,6 +247,13 @@ class Stop(models.Model):
         ('skipped', 'Skipped'),
     ]
 
+    STOP_TYPE_CHOICES = [
+        ('delivery', 'מסירה'),  # Default — deliver something
+        ('pickup', 'איסוף'),  # Pick something up
+        ('service', 'שירות'),  # Do work here (crane, repair, tow dropoff)
+        ('both', 'איסוף + מסירה'),  # Pick up AND deliver at same location
+    ]
+
     schedule        = models.ForeignKey(DailySchedule, on_delete=models.CASCADE, related_name='stops')
     order           = models.PositiveIntegerField()
     site_name       = models.CharField(max_length=200)
@@ -257,6 +272,38 @@ class Stop(models.Model):
 
     allow_driver_reorder = models.BooleanField(default=True,
         help_text='If True, driver can reorder this stop. Set False for time-locked stops.')
+
+    stop_type = models.CharField(
+        max_length=10,
+        choices=STOP_TYPE_CHOICES,
+        default='delivery',
+        help_text='סוג העצירה'
+    )
+
+    # Item reference — what is being picked up or delivered
+    items = models.TextField(
+        blank=True,
+        help_text='פריטים — חבילה #123, רכב 12-345-67, חומרים לאתר...'
+    )
+
+    # Contact at this stop
+    contact_name = models.CharField(max_length=100, blank=True)
+    contact_phone = models.CharField(max_length=20, blank=True)
+
+    # Link delivery stops back to their pickup stop
+    pickup_stop = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='delivery_stops',
+        help_text='עצירת האיסוף שממנה נלקחו הפריטים'
+    )
+
+    # Driver confirmation note
+    driver_note = models.TextField(
+        blank=True,
+        help_text='הערת נהג בסיום'
+    )
 
     class Meta:
         ordering = ['order']
@@ -346,6 +393,12 @@ class Attendance(models.Model):
     clock_out_lng = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     notes        = models.TextField(blank=True)
     edited_by    = models.ForeignKey(Manager, on_delete=models.SET_NULL, null=True, blank=True)
+
+    # Auto-close support: True if this shift was closed by the system because
+    # the driver forgot to clock out (>14h). clock_out will equal clock_in
+    # (zero-hour shift) and a pending AttendanceFixRequest will exist.
+    auto_closed  = models.BooleanField(default=False, db_index=True,
+                       help_text='True if system auto-closed this shift (driver forgot to clock out)')
 
     regular_hours  = models.DecimalField(max_digits=6, decimal_places=2, default=0,
                                           help_text='Hours at normal rate')
@@ -853,3 +906,87 @@ class ChildOfDriver(models.Model):
 
     def __str__(self):
         return f"{self.full_name or 'child'} of {self.driver.full_name}"
+
+
+# ── Public tracking links (client-facing live truck location) ────
+
+import secrets
+
+def _new_tracking_token():
+    """Generates a fresh token per row — must be a callable, not a value."""
+    return secrets.token_urlsafe(24)
+
+
+class TrackingLink(models.Model):
+    """
+    Public tracking link — share with client to show live truck location.
+    No authentication required to view.
+    """
+    token       = models.CharField(max_length=32, unique=True, default=_new_tracking_token)
+    driver      = models.ForeignKey('Driver', on_delete=models.CASCADE, related_name='tracking_links')
+    created_by  = models.ForeignKey('Manager', on_delete=models.CASCADE, related_name='tracking_links')
+    target_stop = models.ForeignKey(
+        'Stop',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='tracking_links',
+        help_text='Optional — pin tracking page to a specific stop (ETA, client notes target).'
+    )
+    label       = models.CharField(max_length=100, blank=True, help_text="e.g. 'משלוח לאתר נתניה'")
+    is_active   = models.BooleanField(default=True)
+    expires_at  = models.DateTimeField(null=True, blank=True)
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Track:{self.token[:8]} → {self.driver.full_name}"
+
+    def is_valid(self):
+        from django.utils import timezone
+        if not self.is_active:
+            return False
+        if self.expires_at and timezone.now() > self.expires_at:
+            return False
+        return True
+
+    @classmethod
+    def generate(cls, driver, manager, label='', hours=24, target_stop=None):
+        from django.utils import timezone
+        from datetime import timedelta
+        return cls.objects.create(
+            token       = _new_tracking_token(),
+            driver      = driver,
+            created_by  = manager,
+            target_stop = target_stop,
+            label       = label,
+            expires_at  = timezone.now() + timedelta(hours=hours),
+        )
+
+
+# ── Stop Tasks (notes / photos / phones attached to stops) ────
+
+
+class StopTask(models.Model):
+    """
+    Notes and attachments for a stop — visible to driver on phone.
+    Can come from manager OR from client via tracking link.
+    """
+    SOURCE_CHOICES = [
+        ('manager', 'Manager'),
+        ('client',  'Client'),
+    ]
+
+    stop       = models.ForeignKey('Stop', on_delete=models.CASCADE, related_name='tasks')
+    source     = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='manager')
+    note       = models.TextField(blank=True)
+    photo      = models.ImageField(upload_to='stop_tasks/%Y/%m/', null=True, blank=True)
+    phone      = models.CharField(max_length=20, blank=True, help_text='Contact phone for driver')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"Task for Stop #{self.stop.order} ({self.source})"

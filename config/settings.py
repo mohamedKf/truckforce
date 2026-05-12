@@ -99,6 +99,17 @@ REST_FRAMEWORK = {
 # ── CORS ──────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL', default=True, cast=bool)
 
+# ── Third-party services ──────────────────────────────────
+# Mapbox: used by route_optimizer.py for stop-order optimization
+# and by the public tracking page's live map. Read at module import,
+# so a restart is required after changing the env var.
+MAPBOX_TOKEN = config('MAPBOX_TOKEN', default='')
+
+# SITE_URL: absolute base URL of this Django deployment. Used by
+# tracking_page (HTML) to build links the client can share. Falls back to
+# whatever request.build_absolute_uri returns if unset.
+SITE_URL = config('SITE_URL', default='')
+
 # ── Media / Static ────────────────────────────────────────
 import cloudinary
 CLOUDINARY_STORAGE = {
