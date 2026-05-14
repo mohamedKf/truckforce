@@ -116,14 +116,6 @@ class VerifyRegistrationCodeView(APIView):
         if not env_code:
             return Response({'error': 'No registration code configured on server. Contact your admin.'}, status=403)
         if env_code != code:
-            # TEMPORARY DEBUG: log what's being compared so we can spot
-            # invisible-character mismatches between env and submitted code.
-            # Remove after this is diagnosed.
-            print(
-                f"[VERIFY-CODE-DEBUG] env={env_code!r} (len={len(env_code)}) "
-                f"submitted={code!r} (len={len(code)})",
-                flush=True,
-            )
             return Response({'error': 'Invalid registration code.'}, status=403)
 
         company = CompanySettings.objects.first()
@@ -1166,6 +1158,8 @@ class DriverLocationUpdateView(APIView):
     # hygiene concerns, not business rules. Tweak if needed.
     MIN_DISTANCE_METERS = 20    # Below this, treat as "didn't move"
     HEARTBEAT_SECONDS   = 300   # Always record at least once every 5 minutes
+    MAX_ACCURACY_METERS = 100   # Reject GPS fixes worse than this (defense-in-depth;
+                                # app should already filter, but old clients exist)
 
     def post(self, request):
         driver = request.driver
@@ -1194,6 +1188,30 @@ class DriverLocationUpdateView(APIView):
 
         lat = request.data.get('latitude')
         lng = request.data.get('longitude')
+        accuracy = request.data.get('accuracy')
+
+        # ── Reject GPS junk before doing any work ──
+        # 200 OK (not 400) so the app doesn't treat it as a retryable failure
+        # and queue it for resend. wrote_row=False makes the no-op explicit.
+        if accuracy is not None:
+            try:
+                acc_val = float(accuracy)
+                if acc_val <= 0 or acc_val > self.MAX_ACCURACY_METERS:
+                    print(
+                        f"[LOCATION] driver={driver.id} "
+                        f"lat={lat} lng={lng} "
+                        f"wrote=False reason=bad_accuracy({acc_val:.1f}m)",
+                        flush=True,
+                    )
+                    return Response({
+                        'ok': True,
+                        'id': None,
+                        'wrote_row': False,
+                        'reason': 'low_accuracy',
+                        'newly_arrived_stops': [],
+                    }, status=status.HTTP_200_OK)
+            except (TypeError, ValueError):
+                pass  # missing/garbage accuracy — fall through, treat as unknown
 
         # ── Dedupe: skip DB write if driver hasn't moved meaningfully ──
         # We still run arrival-detection below so geofence transitions
@@ -1222,7 +1240,7 @@ class DriverLocationUpdateView(APIView):
                 longitude=lng,
                 speed=request.data.get('speed'),
                 heading=request.data.get('heading'),
-                accuracy=request.data.get('accuracy'),
+                accuracy=accuracy,
             )
             wrote_row = True
 
