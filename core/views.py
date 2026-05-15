@@ -1161,6 +1161,14 @@ class DriverLocationUpdateView(APIView):
     MAX_ACCURACY_METERS = 100   # Reject GPS fixes worse than this (defense-in-depth;
                                 # app should already filter, but old clients exist)
 
+    # Anti-jamming filter. Some areas have GPS jamming/spoofing — phone briefly
+    # reports a position 100km away then snaps back. If two consecutive fixes
+    # imply an implausibly high speed, the new one is fake. Only applied when
+    # the previous fix is recent; longer gaps could legitimately span large
+    # distances after a parked-then-driving sequence.
+    MAX_REALISTIC_KMH        = 200    # truck physics ceiling
+    JAMMING_WINDOW_SECONDS   = 600    # 10 minutes — filter only within this
+
     def post(self, request):
         driver = request.driver
 
@@ -1190,6 +1198,27 @@ class DriverLocationUpdateView(APIView):
         lng = request.data.get('longitude')
         accuracy = request.data.get('accuracy')
 
+        # ── Optional client-supplied timestamp ──
+        # Live pings omit this and we use server now(). Replayed pings from
+        # the app's offline buffer include the original recording time, so
+        # the trail shows the truck where it actually was at that moment —
+        # not where the queue happened to be flushed from.
+        from django.utils.dateparse import parse_datetime
+        raw_ts = request.data.get('recorded_at')
+        client_ts = None
+        if raw_ts:
+            try:
+                parsed = parse_datetime(raw_ts)
+                if parsed is not None:
+                    # Sanity: refuse future timestamps and anything > 48h old
+                    # (the app caps at 24h; 48h gives us headroom for clock skew).
+                    now = timezone.now()
+                    if parsed <= now and (now - parsed).total_seconds() < 48 * 3600:
+                        client_ts = parsed
+            except (TypeError, ValueError):
+                pass
+        effective_ts = client_ts or timezone.now()
+
         # ── Reject GPS junk before doing any work ──
         # 200 OK (not 400) so the app doesn't treat it as a retryable failure
         # and queue it for resend. wrote_row=False makes the no-op explicit.
@@ -1216,6 +1245,9 @@ class DriverLocationUpdateView(APIView):
         # ── Dedupe: skip DB write if driver hasn't moved meaningfully ──
         # We still run arrival-detection below so geofence transitions
         # within the 20m threshold still register.
+        # For replayed (cached) pings we use the client's recorded_at as
+        # the basis for the age calculation, so a backlog flush doesn't
+        # collapse into a single row.
         from .geo_utils import haversine_meters
         from datetime import timedelta
 
@@ -1226,11 +1258,45 @@ class DriverLocationUpdateView(APIView):
         wrote_row = False
         loc = last
 
+        # ── Anti-jamming filter ──
+        # If the implied speed between the last DB row and the new fix
+        # exceeds MAX_REALISTIC_KMH within JAMMING_WINDOW_SECONDS, the new
+        # fix is almost certainly spoofed/jammed. Drop silently (200 OK +
+        # wrote_row=False), don't write, don't run arrival detection.
+        if last is not None and lat is not None and lng is not None:
+            try:
+                age_seconds = (effective_ts - last.timestamp).total_seconds()
+                if 0 < age_seconds < self.JAMMING_WINDOW_SECONDS:
+                    dist_meters = haversine_meters(
+                        last.latitude, last.longitude, lat, lng)
+                    implied_kmh = (dist_meters / age_seconds) * 3.6
+                    if implied_kmh > self.MAX_REALISTIC_KMH:
+                        print(
+                            f"[LOCATION] driver={driver.id} "
+                            f"lat={lat} lng={lng} "
+                            f"wrote=False reason=jamming("
+                            f"{dist_meters:.0f}m in {age_seconds:.0f}s "
+                            f"= {implied_kmh:.0f} km/h)",
+                            flush=True,
+                        )
+                        return Response({
+                            'ok': True,
+                            'id': None,
+                            'wrote_row': False,
+                            'reason': 'implausible_speed',
+                            'newly_arrived_stops': [],
+                        }, status=status.HTTP_200_OK)
+            except (TypeError, ValueError):
+                pass  # malformed numbers — fall through and let DB write fail loudly
+
         should_write = True
         if last is not None and lat is not None and lng is not None:
             distance = haversine_meters(last.latitude, last.longitude, lat, lng)
-            age      = (timezone.now() - last.timestamp).total_seconds()
-            if distance < self.MIN_DISTANCE_METERS and age < self.HEARTBEAT_SECONDS:
+            age      = (effective_ts - last.timestamp).total_seconds()
+            # Negative age means the replayed point pre-dates the last DB row
+            # (out-of-order delivery). Always write in that case so we don't
+            # lose historical points.
+            if 0 <= age < self.HEARTBEAT_SECONDS and distance < self.MIN_DISTANCE_METERS:
                 should_write = False
 
         if should_write:
@@ -1242,6 +1308,11 @@ class DriverLocationUpdateView(APIView):
                 heading=request.data.get('heading'),
                 accuracy=accuracy,
             )
+            # Override auto_now_add with the client's timestamp if provided.
+            # Update instead of save() to avoid a second hit on auto_now_add.
+            if client_ts is not None:
+                DriverLocation.objects.filter(pk=loc.pk).update(timestamp=client_ts)
+                loc.timestamp = client_ts  # keep the local instance in sync
             wrote_row = True
 
         # Visible-in-log heartbeat — makes it possible to verify GPS is
