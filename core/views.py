@@ -50,6 +50,8 @@ from .firebase import (
     notify_manager_stop_skipped,
     notify_manager_day_summary,
     notify_driver_payslip_ready,
+    notify_driver_schedule_assigned,
+    notify_driver_schedule_updated,
 )
 from .payroll_engine import generate_payroll
 
@@ -437,6 +439,14 @@ class ScheduleListCreateView(APIView):
         schedule = ser.save()
         print(f"[SCHEDULE-CREATE] ✓ created schedule id={schedule.id}", flush=True)
         publish_event('schedules_changed', by_user_id=getattr(request.manager, 'id', None))
+
+        # Notify the driver — fire and forget. Wrap in try so any FCM
+        # failure (network, bad token) never fails the schedule create.
+        try:
+            notify_driver_schedule_assigned(schedule.driver, schedule)
+        except Exception as e:
+            print(f"[SCHEDULE-CREATE] FCM notify failed: {e}", flush=True)
+
         return Response(DailyScheduleSerializer(schedule).data, status=201)
 
 
@@ -463,10 +473,25 @@ class ScheduleDetailView(APIView):
         obj = self.get_object(pk)
         if not obj:
             return Response({'error': 'Not found'}, status=404)
+
+        stops_before = obj.stops.count()  # capture before save
         ser = DailyScheduleSerializer(obj, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         ser.save()
         publish_event('schedules_changed', by_user_id=getattr(request.manager, 'id', None))
+
+        # Build a short human-readable summary of what changed so the
+        # driver's notification body is useful. We only know the stop
+        # count before/after — anything more would require deep-diffing
+        # the JSON payload, which is overkill here.
+        obj.refresh_from_db()
+        stops_after = obj.stops.count()
+        summary = _schedule_change_summary(stops_before, stops_after)
+        try:
+            notify_driver_schedule_updated(obj.driver, obj, summary)
+        except Exception as e:
+            print(f"[SCHEDULE-UPDATE] FCM notify failed: {e}", flush=True)
+
         return Response(ser.data)
 
     def delete(self, request, pk):
@@ -475,7 +500,25 @@ class ScheduleDetailView(APIView):
         obj = self.get_object(pk)
         if not obj:
             return Response({'error': 'Not found'}, status=404)
+
+        # Capture before delete so we can notify
+        driver = obj.driver
+        date = obj.date
+
         obj.delete()
+
+        try:
+            from .firebase import _log_and_send_driver
+            title = "🗓️ Schedule Cancelled"
+            body  = f"Your schedule for {date.strftime('%d/%m/%Y')} has been cancelled"
+            data  = {
+                "type": "schedule_cancelled",
+                "date": date.isoformat(),
+            }
+            _log_and_send_driver(driver, 'schedule_changed', title, body, data)
+        except Exception as e:
+            print(f"[SCHEDULE-DELETE] FCM notify failed: {e}", flush=True)
+
         return Response(status=204)
 
     def patch(self, request, pk):
@@ -484,11 +527,33 @@ class ScheduleDetailView(APIView):
         obj = self.get_object(pk)
         if not obj:
             return Response({'error': 'Not found'}, status=404)
+
+        stops_before = obj.stops.count()
         ser = DailyScheduleSerializer(obj, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         ser.save()
         publish_event('schedules_changed', by_user_id=getattr(request.manager, 'id', None))
+
+        obj.refresh_from_db()
+        stops_after = obj.stops.count()
+        summary = _schedule_change_summary(stops_before, stops_after)
+        try:
+            notify_driver_schedule_updated(obj.driver, obj, summary)
+        except Exception as e:
+            print(f"[SCHEDULE-UPDATE] FCM notify failed: {e}", flush=True)
+
         return Response(ser.data)
+
+
+def _schedule_change_summary(before: int, after: int) -> str:
+    """Short human phrase describing how the stops list changed."""
+    if after > before:
+        n = after - before
+        return f"{n} new stop{'s' if n != 1 else ''} added"
+    if after < before:
+        n = before - after
+        return f"{n} stop{'s' if n != 1 else ''} removed"
+    return "stops updated"
 
 
 class DriverTodayScheduleView(APIView):

@@ -49,9 +49,16 @@ def _get_db():
         if _db is not None:
             return _db
         try:
-            # Look for credentials file next to manage.py (project root)
+            # Use the path settings.py exposes — this works in both:
+            #   - local dev (defaults to BASE_DIR/firebase-credentials.json)
+            #   - Railway (settings.py writes FIREBASE_CREDENTIALS_JSON env
+            #     var to a temp file and exposes the temp path)
             from django.conf import settings
-            cred_path = os.path.join(str(settings.BASE_DIR), _CREDENTIALS_FILENAME)
+            cred_path = getattr(
+                settings,
+                'FIREBASE_CREDENTIALS_PATH',
+                os.path.join(str(settings.BASE_DIR), _CREDENTIALS_FILENAME),
+            )
             if not os.path.exists(cred_path):
                 print(f"[FIREBASE-SYNC] Credentials file not found at {cred_path} — "
                       f"real-time sync disabled", flush=True)

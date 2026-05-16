@@ -2,6 +2,12 @@ from django.db import models
 from django.contrib.auth.hashers import make_password, check_password
 import math
 
+# Cloudinary storage for non-image files (PDFs, generic documents).
+# ImageField uses the default DEFAULT_FILE_STORAGE (Cloudinary's image storage);
+# FileField for non-images needs RawMediaCloudinaryStorage so Cloudinary stores
+# them as raw binaries instead of trying to treat them as images.
+from cloudinary_storage.storage import RawMediaCloudinaryStorage
+
 
 # ──────────────────────────────────────────────
 # COMPANY SETTINGS
@@ -22,7 +28,7 @@ class CompanySettings(models.Model):
     ]
 
     company_name         = models.CharField(max_length=200)
-    company_logo         = models.ImageField(upload_to='company/', blank=True, null=True)
+    company_logo         = models.ImageField(upload_to='company_logos/', blank=True, null=True)
     phone                = models.CharField(max_length=20, blank=True)
     email                = models.EmailField(blank=True)
     address              = models.TextField(blank=True)
@@ -110,7 +116,7 @@ class Driver(models.Model):
     address      = models.TextField(blank=True)
     birth_date   = models.DateField(null=True, blank=True)
     hire_date    = models.DateField(null=True, blank=True)
-    photo        = models.ImageField(upload_to='profile/', blank=True, null=True,
+    photo        = models.ImageField(upload_to='driver_photos/', blank=True, null=True,
                    help_text='Permanent profile photo served via media URL')
     photo_b64    = models.TextField(blank=True, default='',
                    help_text='Temporary base64 upload — desktop downloads and clears this')
@@ -339,7 +345,7 @@ class Stop(models.Model):
 class StopPhoto(models.Model):
     """Multiple delivery/proof photos per stop (unlimited)."""
     stop        = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name='photos')
-    image       = models.ImageField(upload_to='delivery_photos/%Y/%m/')
+    image       = models.ImageField(upload_to='delivery_photos/')
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -364,9 +370,11 @@ class DeliveryConfirmation(models.Model):
                                         help_text='Phone to send WhatsApp confirmation to')
     signed_by_email = models.EmailField(blank=True,
                                          help_text='Email to send confirmation to')
-    signature_image = models.ImageField(upload_to='signatures/%Y/%m/',
+    signature_image = models.ImageField(upload_to='signatures/',
                                          help_text='PNG of the hand-drawn signature')
-    pdf_file        = models.FileField(upload_to='confirmations/%Y/%m/', blank=True,
+    pdf_file        = models.FileField(upload_to='confirmation_pdfs/',
+                                        storage=RawMediaCloudinaryStorage(),
+                                        blank=True,
                                         help_text='Generated PDF confirmation')
     whatsapp_sent   = models.BooleanField(default=False)
     email_sent      = models.BooleanField(default=False)
@@ -611,11 +619,12 @@ class NotificationLog(models.Model):
         ('payslip_ready', 'Payslip Ready'),
         ('license_expiry', 'License Expiry Warning'),
         ('truck_service', 'Truck Service Due'),
+        ('schedule_changed', 'Schedule Changed'),
     ]
 
     recipient_manager = models.ForeignKey(Manager, on_delete=models.CASCADE, null=True, blank=True)
     recipient_driver  = models.ForeignKey(Driver, on_delete=models.CASCADE, null=True, blank=True)
-    notification_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    notification_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
     title             = models.CharField(max_length=200)
     body              = models.TextField()
     data              = models.JSONField(default=dict, blank=True)  # extra payload
@@ -649,7 +658,8 @@ class Document(models.Model):
     truck       = models.ForeignKey(Truck, on_delete=models.CASCADE, null=True, blank=True, related_name='documents')
     doc_type    = models.CharField(max_length=20, choices=DOC_TYPE_CHOICES)
     title       = models.CharField(max_length=200)
-    file        = models.FileField(upload_to='documents/')
+    file        = models.FileField(upload_to='documents/',
+                                    storage=RawMediaCloudinaryStorage())
     notes       = models.TextField(blank=True)
     uploaded_by = models.ForeignKey(Manager, on_delete=models.SET_NULL, null=True, blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
@@ -799,7 +809,9 @@ class Payslip(models.Model):
     notes = models.TextField(blank=True)
     generated_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    pdf_file = models.FileField(upload_to='payslips/', blank=True, null=True)
+    pdf_file = models.FileField(upload_to='payslips/',
+                                 storage=RawMediaCloudinaryStorage(),
+                                 blank=True, null=True)
 
     class Meta:
         ordering = ['-year', '-month']
@@ -981,7 +993,7 @@ class StopTask(models.Model):
     stop       = models.ForeignKey('Stop', on_delete=models.CASCADE, related_name='tasks')
     source     = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='manager')
     note       = models.TextField(blank=True)
-    photo      = models.ImageField(upload_to='stop_tasks/%Y/%m/', null=True, blank=True)
+    photo      = models.ImageField(upload_to='stop_task_photos/', null=True, blank=True)
     phone      = models.CharField(max_length=20, blank=True, help_text='Contact phone for driver')
     created_at = models.DateTimeField(auto_now_add=True)
 

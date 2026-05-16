@@ -126,10 +126,27 @@ SITE_URL = config('SITE_URL', default='')
 
 # ── Media / Static ────────────────────────────────────────
 import cloudinary
+# ── Media / Static ────────────────────────────────────────
+import cloudinary
 CLOUDINARY_STORAGE = {
     'CLOUD_NAME': config('CLOUDINARY_CLOUD_NAME', default=''),
     'API_KEY':    config('CLOUDINARY_API_KEY',    default=''),
     'API_SECRET': config('CLOUDINARY_API_SECRET', default=''),
+
+    # Auto-optimise uploaded images: shrink to max 2000px on the longest
+    # side, ~80% quality, serve as WebP/AVIF to modern browsers when
+    # supported. Applied at upload time, so storage AND bandwidth are
+    # reduced. Does NOT affect PDFs / raw files (those bypass the image
+    # pipeline entirely via RawMediaCloudinaryStorage in models.py).
+    'TRANSFORMATION': [
+        {
+            'width':        2000,
+            'height':       2000,
+            'crop':         'limit',   # shrink only, never upscale
+            'quality':      80,
+            'fetch_format': 'auto',
+        }
+    ],
 }
 if config('CLOUDINARY_CLOUD_NAME', default=''):
     DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
