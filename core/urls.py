@@ -55,6 +55,7 @@ urlpatterns = [
     path('stops/<int:pk>/tasks/',         views.StopTaskListCreateView.as_view()),  # GET/POST tasks
     path('stops/<int:stop_id>/photos/',   views.StopPhotoListCreateView.as_view()),
     path('stops/<int:pk>/',               views.StopDetailView.as_view()),       # manager: edit/delete
+    path('stops/<int:pk>/eta-distance/',  views.StopETADistanceView.as_view()),
     path('stop-photos/<int:pk>/',         views.StopPhotoDeleteView.as_view()),
     path('stop-tasks/<int:pk>/',          views.StopTaskDeleteView.as_view()),
 

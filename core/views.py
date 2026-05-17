@@ -3689,6 +3689,84 @@ class RouteETAView(APIView):
         })
 
 
+class StopETADistanceView(APIView):
+    """GET /api/stops/<pk>/eta-distance/
+
+    Manager-facing endpoint used by the Live Map popup. Given a stop ID,
+    returns the ETA window (min/max minutes & HH:MM) plus straight-line
+    distance from the assigned driver's current location.
+
+    Distinct from RouteETAView (which is keyed off a tracking link token
+    for public use) — this one requires manager auth and accepts any
+    stop on any active schedule.
+    """
+    permission_classes = [IsManager]
+
+    def get(self, request, pk):
+        try:
+            stop = Stop.objects.select_related('schedule', 'schedule__driver').get(pk=pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Stop not found'}, status=404)
+
+        driver = stop.schedule.driver
+        # Latest GPS row (model orders by -timestamp so .first() == newest).
+        latest = DriverLocation.objects.filter(driver=driver).first()
+        if not latest:
+            return Response({
+                'no_location':    True,
+                'driver_name':    driver.full_name,
+                'driver_phone':   driver.phone,
+                'contact_phone':  stop.contact_phone or '',
+                'contact_name':   stop.contact_name or '',
+                'site_name':      stop.site_name,
+                'address':        stop.address or '',
+                'status':         stop.status,
+            })
+
+        # Distance: straight-line km. Driving distance would need another
+        # Mapbox call; this is the popup teaser so haversine is fine.
+        from .route_optimizer import _haversine_km
+        distance_km = round(_haversine_km(
+            float(latest.latitude), float(latest.longitude),
+            float(stop.latitude),   float(stop.longitude),
+        ), 1) if (stop.latitude and stop.longitude) else None
+
+        # ETA: walk pending stops up to this one. If `stop` isn't actually
+        # pending (already done/skipped) we still compute a best-effort
+        # estimate via direct drive from driver → stop.
+        stops_ahead = list(
+            stop.schedule.stops.filter(status='pending').order_by('order')
+        )
+        from .route_optimizer import calculate_eta
+        min_eta, max_eta = calculate_eta(
+            float(latest.latitude), float(latest.longitude),
+            stops_ahead, stop.id,
+        )
+
+        from datetime import timedelta
+        now = tz.now()
+        eta_min_time = (now + timedelta(minutes=min_eta)).strftime('%H:%M')
+        eta_max_time = (now + timedelta(minutes=max_eta)).strftime('%H:%M')
+
+        return Response({
+            'driver_name':      driver.full_name,
+            'driver_phone':     driver.phone,
+            'contact_name':     stop.contact_name or '',
+            'contact_phone':    stop.contact_phone or '',
+            'site_name':        stop.site_name,
+            'address':          stop.address or '',
+            'status':           stop.status,
+            'expected_arrival': stop.expected_arrival.strftime('%H:%M') if stop.expected_arrival else None,
+            'order':            stop.order,
+            'eta_min_minutes':  min_eta,
+            'eta_max_minutes':  max_eta,
+            'eta_min_time':     eta_min_time,
+            'eta_max_time':     eta_max_time,
+            'distance_km':      distance_km,
+            'location_age_sec': int((tz.now() - latest.timestamp).total_seconds()),
+        })
+
+
 class StopCompleteView(APIView):
     """
     POST /api/stops/<pk>/complete/

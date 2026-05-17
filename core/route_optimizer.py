@@ -366,6 +366,21 @@ def _haversine_min(lat1, lng1, lat2, lng2, avg_speed_kmh=45):
     return (km / avg_speed_kmh) * 60
 
 
+def _haversine_km(lat1, lng1, lat2, lng2):
+    """Great-circle distance in kilometres. Used in places like the
+    Live Map popup where we want to show 'X km away' without paying for
+    a driving-distance Mapbox call."""
+    import math
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+           * math.sin(dlng / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+
 def _check_violations(ordered_ids, lookup, driver_lat, driver_lng,
                       durations_min, schedule_date, stop_dwell_min=10,
                       start_time=None):
