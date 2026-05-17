@@ -62,7 +62,9 @@ urlpatterns = [
     path('attendance/',                   views.AttendanceListView.as_view()),
     path('attendance/clock-in/',          views.ClockInView.as_view()),
     path('attendance/clock-out/',         views.ClockOutView.as_view()),
+    path('attendance/zero-shifts/',       views.ZeroShiftListView.as_view()),
     path('attendance/<int:pk>/',          views.AttendanceDetailView.as_view()),
+    path('attendance/<int:pk>/manual-close/', views.AttendanceManualCloseView.as_view()),
 
     # ── Attendance fix requests ───────────────────────
     path('attendance-fix-requests/',                 views.AttendanceFixRequestListCreateView.as_view()),

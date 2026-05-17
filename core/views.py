@@ -2,7 +2,7 @@ from django.http import JsonResponse, FileResponse, Http404
 from django.utils import timezone
 from django.db import transaction
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, F
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.views.decorators.http import require_GET
@@ -1950,6 +1950,184 @@ class StopPhotoDeleteView(APIView):
 # ──────────────────────────────────────────────
 # ATTENDANCE FIX REQUESTS
 # ──────────────────────────────────────────────
+
+class ZeroShiftListView(APIView):
+    """List attendance records that were auto-closed to zero hours.
+
+    A "zero shift" is an attendance row where the system filled in a fake
+    clock_out (== clock_in) because the driver forgot to clock out at the
+    end of their shift. The driver got credited for the day but the hours
+    are 0, which makes payslips and reports inaccurate.
+
+    The manager uses this list to manually correct each row by entering
+    the real end time, after which the existing payslip should be
+    regenerated to pick up the new hours.
+
+    GET /api/attendance/zero-shifts/
+        ?year=2026          (optional)
+        &month=5            (optional, requires year)
+        &driver_id=2        (optional)
+        &resolved=false     (default false — show only unresolved)
+    """
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        qs = Attendance.objects.filter(auto_closed=True).select_related('driver')
+        # "zero shift" = clock_out is non-null but equal to clock_in (0h shift).
+        # We also include rows where clock_out is null entirely, but the
+        # auto-close path always sets clock_out so that's a sanity check.
+        qs = qs.exclude(clock_in__isnull=True)
+        qs = qs.filter(Q(clock_out=F('clock_in')) | Q(clock_out__isnull=True))
+
+        # Optional filters
+        year = request.query_params.get('year')
+        month = request.query_params.get('month')
+        driver_id = request.query_params.get('driver_id')
+        resolved = request.query_params.get('resolved', 'false').lower() == 'true'
+
+        if year:
+            try:
+                qs = qs.filter(date__year=int(year))
+            except (TypeError, ValueError):
+                pass
+        if month and year:
+            try:
+                qs = qs.filter(date__month=int(month))
+            except (TypeError, ValueError):
+                pass
+        if driver_id:
+            qs = qs.filter(driver_id=driver_id)
+        # Resolved = the manager has already manually fixed it (auto_closed
+        # flipped back to False after manual close). By default we hide
+        # those; pass ?resolved=true to see history.
+        # Note: our model has only one flag. We treat "no longer zero" as
+        # resolved — handled implicitly by the F() filter above. So this
+        # endpoint can only return unresolved rows currently. The flag is
+        # kept for future extension.
+
+        qs = qs.order_by('-date', 'driver__full_name')
+
+        # Fetch the most-recent pending fix request per attendance to show
+        # the driver's note (if any) alongside the row.
+        results = []
+        for att in qs:
+            fix = (AttendanceFixRequest.objects
+                   .filter(driver=att.driver, date=att.date, status='pending')
+                   .order_by('-created_at')
+                   .first())
+            results.append({
+                'id':                 att.id,
+                'driver_id':          att.driver_id,
+                'driver_name':        att.driver.full_name,
+                'date':               att.date.isoformat(),
+                'clock_in':           att.clock_in.isoformat() if att.clock_in else None,
+                'clock_out':          att.clock_out.isoformat() if att.clock_out else None,
+                'auto_closed':        att.auto_closed,
+                'fix_request_id':     fix.id if fix else None,
+                'fix_request_reason': fix.reason if fix else '',
+            })
+        return Response({'count': len(results), 'results': results})
+
+
+class AttendanceManualCloseView(APIView):
+    """Manager sets the real clock_out time for an attendance row.
+
+    Used to fix shifts that were auto-closed to zero by the nightly
+    auto-close job. After saving, the row's hours are recomputed and any
+    pending fix-request for that day is auto-resolved. The Payslip for
+    that month is NOT auto-regenerated — the manager regenerates it
+    explicitly from the Salaries page.
+
+    POST /api/attendance/<pk>/manual-close/
+    Body:
+        {
+            "clock_out": "2026-05-15T17:30:00",   # required, ISO datetime
+            "notes":     "Confirmed via phone"     # optional
+        }
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        att = get_object_or_404(Attendance, pk=pk)
+        clock_out_raw = request.data.get('clock_out')
+        notes = request.data.get('notes', '') or ''
+
+        if not clock_out_raw:
+            return Response({'error': 'clock_out is required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Parse ISO datetime. Accept "2026-05-15T17:30:00" or "...Z".
+        try:
+            from django.utils.dateparse import parse_datetime
+            clock_out = parse_datetime(str(clock_out_raw))
+            if clock_out is None:
+                raise ValueError('unparseable')
+        except (TypeError, ValueError):
+            return Response({'error': f'invalid clock_out format: {clock_out_raw}'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        # Make tz-aware if naive (assume local tz from settings)
+        if timezone.is_naive(clock_out):
+            clock_out = timezone.make_aware(clock_out)
+
+        if not att.clock_in:
+            return Response({'error': 'attendance has no clock_in to compare against'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate: clock_out after clock_in, and not absurdly far in the
+        # future (more than 24h after clock_in is almost certainly a typo).
+        if clock_out <= att.clock_in:
+            return Response({'error': 'clock_out must be after clock_in'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        max_shift_hours = 24
+        delta_h = (clock_out - att.clock_in).total_seconds() / 3600
+        if delta_h > max_shift_hours:
+            return Response({
+                'error': f'clock_out is {delta_h:.1f}h after clock_in '
+                         f'(more than {max_shift_hours}h max). Re-check the time.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Save the corrected times. Clear auto_closed so this row no longer
+        # appears in the zero-shifts list. Recompute hour buckets.
+        att.clock_out = clock_out
+        att.auto_closed = False
+        if notes:
+            note_prefix = f"[Manual close by manager on {timezone.now().strftime('%Y-%m-%d %H:%M')}] "
+            att.notes = (note_prefix + notes + ("\n\n" + att.notes if att.notes else ''))
+        att.edited_by = getattr(request, 'manager', None)
+        att.calculate_hours()
+        att.save(update_fields=[
+            'clock_out', 'auto_closed', 'notes', 'edited_by',
+            'regular_hours', 'overtime_125_h', 'overtime_150_h',
+        ])
+
+        # Auto-resolve any pending fix request for this attendance day so
+        # it doesn't keep nagging the manager. We don't touch fix requests
+        # that are already approved/rejected.
+        AttendanceFixRequest.objects.filter(
+            driver=att.driver, date=att.date, status='pending'
+        ).update(
+            status='approved',
+            decided_at=timezone.now(),
+            decided_by=getattr(request, 'manager', None),
+            manager_note='Auto-resolved by manual clock-out correction.',
+        )
+
+        print(f"[ATTENDANCE-MANUAL-CLOSE] driver={att.driver_id} date={att.date} "
+              f"clock_out={att.clock_out.isoformat()} "
+              f"hours={delta_h:.2f}", flush=True)
+
+        return Response({
+            'id':            att.id,
+            'driver_id':     att.driver_id,
+            'date':          att.date.isoformat(),
+            'clock_in':      att.clock_in.isoformat(),
+            'clock_out':     att.clock_out.isoformat(),
+            'regular_hours': float(att.regular_hours),
+            'overtime_125_h': float(att.overtime_125_h),
+            'overtime_150_h': float(att.overtime_150_h),
+            'auto_closed':   att.auto_closed,
+        })
+
 
 class AttendanceFixRequestListCreateView(APIView):
     """
