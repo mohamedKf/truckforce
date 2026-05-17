@@ -3001,6 +3001,22 @@ class OptimizeRouteView(APIView):
 
     def post(self, request, pk):
         try:
+            return self._do_optimize(request, pk)
+        except Exception as e:
+            # Print the full traceback into Railway logs and return a JSON
+            # error to the client. Without this, an uncaught exception
+            # produces an HTML 500 page which the Flutter app can't parse
+            # and surfaces as FormatException.
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[ROUTE-OPTIMIZE] crashed: {e}\n{tb}", flush=True)
+            return Response(
+                {'error': f'Server error: {type(e).__name__}: {e}'},
+                status=500,
+            )
+
+    def _do_optimize(self, request, pk):
+        try:
             schedule = DailySchedule.objects.prefetch_related('stops').get(pk=pk)
         except DailySchedule.DoesNotExist:
             return Response({'error': 'Schedule not found'}, status=404)
@@ -3050,12 +3066,14 @@ class OptimizeRouteView(APIView):
                 schedule_date=schedule.date,
             )
 
-        # Save suggestion to schedule
+        # Save suggestion to schedule. Skip the geometry — it's not needed
+        # for re-display and bloats the JSON column. If we ever want to draw
+        # the polyline on the office map, store it separately or re-call
+        # Mapbox when needed.
         schedule.route_suggestion = {
             'ordered_stop_ids':       result.get('ordered_stop_ids', []),
             'durations':              result.get('durations', []),
             'total_duration_minutes': result.get('total_duration_minutes', 0),
-            'geometry':               result.get('geometry'),
             'driver_lat':             driver_lat,
             'driver_lng':             driver_lng,
             'mode':                   mode,
@@ -3088,12 +3106,15 @@ class OptimizeRouteView(APIView):
               f"{result.get('total_duration_minutes', 0)} min, mode={mode}, "
               f"violations={len(deadline_violations)}", flush=True)
 
+        # Note: `geometry` (full Mapbox route polyline) is intentionally NOT
+        # returned to the client. It can be tens of KB and Flutter doesn't
+        # draw it in the preview dialog. The geometry is still saved on the
+        # schedule for the office map view, if needed.
         return Response({
             'ok':                     True,
             'ordered_stop_ids':       result.get('ordered_stop_ids', []),
             'durations':              result.get('durations', []),
             'total_duration_minutes': result.get('total_duration_minutes', 0),
-            'geometry':               result.get('geometry'),
             'method':                 result.get('method', 'mapbox'),
             'mode':                   mode,
             'deadline_violations':    deadline_violations,
@@ -3110,6 +3131,18 @@ class ApplyRouteSuggestionView(APIView):
     permission_classes = [IsManagerOrDriver]
 
     def post(self, request, pk):
+        try:
+            return self._do_apply(request, pk)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[ROUTE-APPLY] crashed: {e}\n{tb}", flush=True)
+            return Response(
+                {'error': f'Server error: {type(e).__name__}: {e}'},
+                status=500,
+            )
+
+    def _do_apply(self, request, pk):
         try:
             schedule = DailySchedule.objects.get(pk=pk)
         except DailySchedule.DoesNotExist:
