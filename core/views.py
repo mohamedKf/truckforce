@@ -3094,7 +3094,7 @@ class OptimizeRouteView(APIView):
             if getattr(request, 'driver', None) is not None
             else None
         )
-        publish_event('route_suggestion', by_user_id=by_user_id, extra={
+        publish_event('route_suggestion', by_user_id=by_user_id, payload={
             'schedule_id':            pk,
             'driver_id':              driver.id,
             'total_duration_minutes': result.get('total_duration_minutes', 0),
@@ -3181,7 +3181,7 @@ class ApplyRouteSuggestionView(APIView):
             if getattr(request, 'driver', None) is not None
             else None
         )
-        publish_event('route_confirmed', by_user_id=by_user_id, extra={
+        publish_event('route_confirmed', by_user_id=by_user_id, payload={
             'schedule_id': pk,
             'driver_id':   schedule.driver.id,
         })
@@ -3280,7 +3280,7 @@ class ClientNoteView(APIView):
         )
 
         # Notify driver via Firebase
-        publish_event('client_note_added', extra={
+        publish_event('client_note_added', payload={
             'stop_id':   stop.id,
             'stop_name': stop.site_name,
             'driver_id': stop.schedule.driver.id,
@@ -3381,7 +3381,7 @@ class StopCompleteView(APIView):
               f"(driver: {stop.schedule.driver.full_name})", flush=True)
 
         # Notify office via Firebase
-        publish_event('stop_updated', extra={
+        publish_event('stop_updated', payload={
             'stop_id': stop.id,
             'stop_name': stop.site_name,
             'stop_type': stop.stop_type,
