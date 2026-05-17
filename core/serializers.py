@@ -11,6 +11,42 @@ from .models import (
 
 
 # ──────────────────────────────────────────────
+# URL HELPERS — Cloudinary returns absolute URLs already
+# ──────────────────────────────────────────────
+
+def _abs_url(field_file, request=None):
+    """Return an absolute URL for a FileField/ImageField, defensively.
+
+    Cloudinary's storage backend already returns FULLY-QUALIFIED URLs from
+    `field.url` (e.g. https://res.cloudinary.com/<cloud>/image/upload/<path>).
+    If we naively call `request.build_absolute_uri(url)` on top, certain
+    edge cases (relative-looking inputs after redirects, mis-encoded slashes,
+    paths starting with a single `/`) can produce a doubled prefix like:
+
+        https://res.cloudinary.com/.../upload/https:/res.cloudinary.com/.../upload/X
+
+    This helper short-circuits: if the field's URL is already absolute,
+    return it as-is. Only fall back to build_absolute_uri for paths that
+    truly need the Django host (e.g. legacy local-media leftovers).
+    """
+    if not field_file:
+        return None
+    try:
+        url = field_file.url
+    except (ValueError, AttributeError):
+        return None
+    if not url:
+        return None
+    # Cloudinary URLs are always absolute. Same for any other full URL.
+    if url.startswith(("http://", "https://")):
+        return url
+    # Otherwise it's a relative path (e.g. /media/...) — needs absolutizing.
+    if request is not None:
+        return request.build_absolute_uri(url)
+    return url
+
+
+# ──────────────────────────────────────────────
 # AUTH TOKEN (simple custom token)
 # ──────────────────────────────────────────────
 
@@ -29,9 +65,15 @@ class DriverLoginSerializer(serializers.Serializer):
 # ──────────────────────────────────────────────
 
 class CompanySettingsSerializer(serializers.ModelSerializer):
+    # Cloudinary URL safety — see _abs_url at top of file.
+    company_logo = serializers.SerializerMethodField()
+
     class Meta:
         model  = CompanySettings
         fields = '__all__'
+
+    def get_company_logo(self, obj):
+        return _abs_url(obj.company_logo, self.context.get('request'))
 
 
 # ──────────────────────────────────────────────
@@ -74,6 +116,10 @@ class ManagerSerializer(serializers.ModelSerializer):
 
 class DriverSerializer(serializers.ModelSerializer):
     password  = serializers.CharField(write_only=True, required=False)
+    # Both `photo` and `photo_url` return the same safe absolute URL. We keep
+    # both names so existing clients (Flutter app reads `photo`, desktop reads
+    # `photo_url`) don't have to change in lockstep.
+    photo     = serializers.SerializerMethodField()
     photo_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -92,13 +138,15 @@ class DriverSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at']
 
+    def get_photo(self, obj):
+        # Same safe URL — kept for clients that read `photo` directly.
+        return _abs_url(obj.photo, self.context.get('request'))
+
     def get_photo_url(self, obj):
-        request = self.context.get('request')
-        if obj.photo and request:
-            return request.build_absolute_uri(obj.photo.url)
-        if obj.photo:
-            return obj.photo.url
-        return None
+        # Cloudinary returns absolute URLs from obj.photo.url already, so we
+        # MUST NOT re-wrap with request.build_absolute_uri — that produces
+        # a doubled prefix on some Django versions. _abs_url handles this.
+        return _abs_url(obj.photo, self.context.get('request'))
 
     def create(self, validated_data):
         raw_pw = validated_data.pop('password', None)
@@ -162,10 +210,18 @@ class TruckListSerializer(serializers.ModelSerializer):
 # ──────────────────────────────────────────────
 
 class StopPhotoSerializer(serializers.ModelSerializer):
+    # Override default ImageField URL serialization. DRF would call
+    # request.build_absolute_uri on top of Cloudinary's already-absolute
+    # URL, which can double-prefix. _abs_url handles it safely.
+    image = serializers.SerializerMethodField()
+
     class Meta:
         model  = StopPhoto
         fields = ['id', 'stop', 'image', 'uploaded_at']
         read_only_fields = ['uploaded_at']
+
+    def get_image(self, obj):
+        return _abs_url(obj.image, self.context.get('request'))
 
 
 class StopSerializer(serializers.ModelSerializer):
@@ -374,10 +430,16 @@ class NotificationLogSerializer(serializers.ModelSerializer):
 # ──────────────────────────────────────────────
 
 class DocumentSerializer(serializers.ModelSerializer):
+    # Same safe-URL handling as Driver.photo etc. — see _abs_url at top.
+    file = serializers.SerializerMethodField()
+
     class Meta:
         model  = Document
         fields = '__all__'
         read_only_fields = ['uploaded_at']
+
+    def get_file(self, obj):
+        return _abs_url(obj.file, self.context.get('request'))
 
 
 class AccountantSerializer(serializers.ModelSerializer):
@@ -420,11 +482,16 @@ class PayrollConfigSerializer(serializers.ModelSerializer):
 class PayslipSerializer(serializers.ModelSerializer):
     driver_name   = serializers.CharField(source='driver.full_name', read_only=True)
     driver_id_num = serializers.CharField(source='driver.id_number', read_only=True)
+    # Cloudinary URL safety — see _abs_url at top of file.
+    pdf_file      = serializers.SerializerMethodField()
 
     class Meta:
         model  = Payslip
         fields = '__all__'
         read_only_fields = ['generated_at', 'updated_at']
+
+    def get_pdf_file(self, obj):
+        return _abs_url(obj.pdf_file, self.context.get('request'))
 
 
 class PayslipSummarySerializer(serializers.ModelSerializer):
@@ -462,7 +529,13 @@ class AttendanceFixRequestSerializer(serializers.ModelSerializer):
 # ─────────────────────────────────────────────
 
 class DeliveryConfirmationSerializer(serializers.ModelSerializer):
+    # Raw fields ALSO go through _abs_url because DRF's default file URL
+    # serialization is just as prone to double-prefix as the legacy
+    # build_absolute_uri pattern was. Both `signature_image` and
+    # `signature_image_url` return the same safe URL — kept for back-compat.
+    signature_image     = serializers.SerializerMethodField()
     signature_image_url = serializers.SerializerMethodField()
+    pdf_file            = serializers.SerializerMethodField()
     pdf_url             = serializers.SerializerMethodField()
 
     class Meta:
@@ -476,14 +549,14 @@ class DeliveryConfirmationSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'whatsapp_sent', 'email_sent', 'created_at',
                             'signature_image_url', 'pdf_url']
 
+    def get_signature_image(self, obj):
+        return _abs_url(obj.signature_image, self.context.get('request'))
+
     def get_signature_image_url(self, obj):
-        request = self.context.get('request')
-        if obj.signature_image and request:
-            return request.build_absolute_uri(obj.signature_image.url)
-        return str(obj.signature_image) if obj.signature_image else None
+        return _abs_url(obj.signature_image, self.context.get('request'))
+
+    def get_pdf_file(self, obj):
+        return _abs_url(obj.pdf_file, self.context.get('request'))
 
     def get_pdf_url(self, obj):
-        request = self.context.get('request')
-        if obj.pdf_file and request:
-            return request.build_absolute_uri(obj.pdf_file.url)
-        return str(obj.pdf_file) if obj.pdf_file else None
+        return _abs_url(obj.pdf_file, self.context.get('request'))
