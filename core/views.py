@@ -1811,6 +1811,50 @@ class PayslipDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class PayslipUploadPDFView(APIView):
+    """Upload a generated payslip PDF and attach it to the Payslip record.
+
+    The desktop app generates the PDF locally (Hebrew RTL Israeli format)
+    then POSTs the file here so it lives in Cloudinary alongside other
+    documents. The model field uses RawMediaCloudinaryStorage so the file
+    goes to the 'payslips/' folder in our Cloudinary account.
+
+    POST /api/payslips/<pk>/upload-pdf/
+    multipart/form-data:
+        pdf_file: <binary>
+
+    Response: { "id": pk, "pdf_url": "<cloudinary url>" }
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        ps = get_object_or_404(Payslip, pk=pk)
+        pdf = request.FILES.get('pdf_file')
+        if not pdf:
+            return Response(
+                {'error': 'pdf_file is required (multipart/form-data)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        # Optional: sanity-check extension. Cloudinary doesn't enforce mime.
+        if not pdf.name.lower().endswith('.pdf'):
+            return Response(
+                {'error': 'file must be a .pdf'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Predictable storage filename so re-uploads overwrite cleanly.
+        # Cloudinary appends its own random suffix anyway, but a stable
+        # prefix makes the file easier to find in the dashboard.
+        stable_name = f"payslip_{ps.driver_id}_{ps.year:04d}-{ps.month:02d}.pdf"
+        ps.pdf_file.save(stable_name, pdf, save=True)
+        print(f"[PAYSLIP-PDF] uploaded payslip={ps.id} → {ps.pdf_file.url}",
+              flush=True)
+        return Response({
+            'id': ps.id,
+            'pdf_url': ps.pdf_file.url if ps.pdf_file else None,
+        })
+
+
 class PayslipGenerateView(APIView):
     """
     POST to generate payslips.

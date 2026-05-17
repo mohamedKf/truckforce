@@ -88,6 +88,7 @@ urlpatterns = [
     path('payslips/',                     views.PayslipListView.as_view()),
     path('payslips/generate/',            views.PayslipGenerateView.as_view()),
     path('payslips/<int:pk>/',            views.PayslipDetailView.as_view()),
+    path('payslips/<int:pk>/upload-pdf/', views.PayslipUploadPDFView.as_view()),
 
     # ── Accountants ───────────────────────────────────
     path('accountants/',                  views.AccountantListCreateView.as_view()),
