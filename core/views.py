@@ -2643,15 +2643,36 @@ Now includes:
 
 @require_GET
 def tracking_page(request, token):
+    """Public-facing client tracking page.
+
+    Renders a single Hebrew-RTL HTML page that, once the client opens the
+    shared link, polls our /api/track/<token>/data/ endpoint every 30s
+    and updates a live map with the truck position + the client's stop +
+    anonymized dots for the route's other stops.
+    """
     try:
         link = TrackingLink.objects.select_related(
             'driver', 'target_stop'
         ).get(token=token)
     except TrackingLink.DoesNotExist:
-        return HttpResponse('<h2 style="color:#fff;font-family:sans-serif;text-align:center;margin-top:40px;">קישור לא נמצא</h2>', status=404)
+        return HttpResponse(
+            '<h2 style="color:#fff;font-family:sans-serif;text-align:center;'
+            'margin-top:40px;">קישור לא נמצא</h2>',
+            status=404,
+        )
 
     if not link.is_valid():
-        return HttpResponse('''<html dir="rtl" style="background:#0a0a0a;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;"><div style="text-align:center;"><div style="font-size:48px;">⏱</div><h2 style="color:#F5A623;">הקישור פג תוקף</h2><p style="color:#888;">פנה לחברה לקבלת קישור חדש</p></div></html>''', status=410)
+        return HttpResponse(
+            '<html dir="rtl" style="background:#0a0a0a;color:#fff;'
+            'font-family:sans-serif;display:flex;align-items:center;'
+            'justify-content:center;height:100vh;margin:0;">'
+            '<div style="text-align:center;">'
+            '<div style="font-size:48px;">⏱</div>'
+            '<h2 style="color:#F5A623;">הקישור פג תוקף</h2>'
+            '<p style="color:#888;">פנה לחברה לקבלת קישור חדש</p>'
+            '</div></html>',
+            status=410,
+        )
 
     from django.conf import settings
     driver       = link.driver
@@ -2661,6 +2682,8 @@ def tracking_page(request, token):
     stop_id      = target_stop.id if target_stop else ''
     stop_name    = target_stop.site_name if target_stop else ''
 
+    # All HTML/CSS/JS lives in this f-string for now — single-page deploys
+    # are easier to ship and there's no build step to babysit.
     html = f'''<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
@@ -2672,17 +2695,35 @@ def tracking_page(request, token):
 <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
-body{{background:#0A0A0A;color:#fff;font-family:-apple-system,sans-serif;min-height:100vh;display:flex;flex-direction:column;}}
+body{{background:#0A0A0A;color:#fff;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;min-height:100vh;display:flex;flex-direction:column;}}
 #header{{padding:14px 16px;background:#111;border-bottom:1px solid #1E1E1E;display:flex;align-items:center;gap:12px;}}
 #logo{{font-size:28px;}}
-#info h1{{font-size:16px;font-weight:700;}}
+#info h1{{font-size:16px;font-weight:700;line-height:1.2;}}
 #info p{{font-size:12px;color:#888;margin-top:2px;}}
-#map{{height:55vh;}}
-#eta-card{{background:#111;border-top:1px solid #1E1E1E;padding:16px;}}
-#eta-time{{font-size:28px;font-weight:800;color:#F5A623;font-family:monospace;}}
-#eta-label{{font-size:13px;color:#888;margin-bottom:4px;}}
-#eta-msg{{font-size:14px;color:#ccc;margin-top:6px;}}
-#notes-section{{background:#0D0D0D;padding:16px;flex:1;}}
+.dot-live{{width:8px;height:8px;border-radius:50%;background:#22C55E;display:inline-block;margin-left:6px;animation:pulse 2s infinite;}}
+@keyframes pulse{{0%,100%{{opacity:1;}}50%{{opacity:0.3;}}}}
+#status-strip{{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#0F0F0F;border-bottom:1px solid #1A1A1A;}}
+#position{{font-size:13px;color:#ccc;}}
+#position strong{{color:#F5A623;font-size:15px;}}
+#call-btn{{background:#22C55E;color:#000;border:none;padding:8px 14px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;display:none;text-decoration:none;}}
+#call-btn:active{{transform:scale(0.97);}}
+#map{{height:50vh;min-height:340px;}}
+#eta-card{{background:#111;border-top:1px solid #1E1E1E;padding:14px 16px;}}
+#eta-row{{display:flex;align-items:baseline;gap:10px;}}
+#eta-time{{font-size:26px;font-weight:800;color:#F5A623;font-family:monospace;}}
+#eta-label{{font-size:13px;color:#888;}}
+#eta-msg{{font-size:13px;color:#ccc;margin-top:6px;}}
+#status-badge{{display:inline-block;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:700;margin-inline-start:8px;}}
+.s-pending{{background:rgba(245,166,35,0.15);color:#F5A623;}}
+.s-done{{background:rgba(34,197,94,0.15);color:#22C55E;}}
+.s-skipped{{background:rgba(239,68,68,0.15);color:#EF4444;}}
+#proof-section{{background:#0D0D0D;padding:14px 16px;border-top:1px solid #1A1A1A;}}
+#proof-title{{font-size:13px;font-weight:700;color:#F5A623;margin-bottom:10px;}}
+#proof-empty{{font-size:12px;color:#666;text-align:center;padding:18px 0;}}
+#proof-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px;}}
+.proof-img{{aspect-ratio:1/1;background:#1A1A1A;border:1px solid #2A2A2A;border-radius:8px;overflow:hidden;cursor:pointer;}}
+.proof-img img{{width:100%;height:100%;object-fit:cover;}}
+#notes-section{{background:#0D0D0D;padding:16px;flex:1;border-top:1px solid #1A1A1A;}}
 #notes-title{{font-size:14px;font-weight:700;color:#F5A623;margin-bottom:12px;}}
 .note-input{{width:100%;background:#1A1A1A;border:1px solid #2A2A2A;border-radius:10px;padding:12px;color:#fff;font-size:14px;font-family:inherit;resize:none;}}
 .note-input:focus{{outline:none;border-color:#F5A623;}}
@@ -2691,12 +2732,13 @@ body{{background:#0A0A0A;color:#fff;font-family:-apple-system,sans-serif;min-hei
 .photo-label:hover{{border-color:#F5A623;color:#F5A623;}}
 #photo-preview{{width:100%;border-radius:10px;margin-top:8px;display:none;}}
 .send-btn{{width:100%;background:#F5A623;color:#000;border:none;border-radius:10px;padding:14px;font-size:16px;font-weight:800;margin-top:12px;cursor:pointer;}}
-.send-btn:hover{{background:#FFB74D;}}
+.send-btn:active{{transform:scale(0.99);}}
 .send-btn:disabled{{opacity:0.5;cursor:not-allowed;}}
 #success{{display:none;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);border-radius:10px;padding:14px;text-align:center;color:#22C55E;font-weight:700;margin-top:12px;}}
-#powered{{text-align:center;font-size:11px;color:#333;padding:12px;}}
-.dot{{width:8px;height:8px;border-radius:50%;background:#22C55E;display:inline-block;margin-left:6px;animation:pulse 2s infinite;}}
-@keyframes pulse{{0%,100%{{opacity:1;}}50%{{opacity:0.3;}}}}
+#powered{{text-align:center;font-size:11px;color:#333;padding:14px;}}
+/* Lightbox for tapping a proof photo. */
+#lightbox{{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.95);z-index:1000;align-items:center;justify-content:center;cursor:pointer;}}
+#lightbox img{{max-width:95vw;max-height:95vh;border-radius:8px;}}
 </style>
 </head>
 <body>
@@ -2704,27 +2746,38 @@ body{{background:#0A0A0A;color:#fff;font-family:-apple-system,sans-serif;min-hei
 <div id="header">
   <div id="logo">🚛</div>
   <div id="info">
-    <h1>{stop_name or 'מעקב משלוח'}</h1>
+    <h1 id="stop-title">{stop_name or 'מעקב משלוח'}</h1>
     <p id="truck-sub">מחשב זמן הגעה...</p>
   </div>
-  <span class="dot" style="margin-inline-start:auto;"></span>
+  <span class="dot-live" style="margin-inline-start:auto;"></span>
+</div>
+
+<div id="status-strip">
+  <div id="position">—</div>
+  <a id="call-btn" href="tel:">📞 התקשר לנהג</a>
 </div>
 
 <div id="map"></div>
 
 <div id="eta-card">
-  <div id="eta-label">זמן הגעה משוער</div>
-  <div id="eta-time">--:-- – --:--</div>
+  <div id="eta-label">זמן הגעה משוער <span id="status-badge"></span></div>
+  <div id="eta-row">
+    <div id="eta-time">--:-- – --:--</div>
+  </div>
   <div id="eta-msg">מחשב...</div>
+</div>
+
+<div id="proof-section">
+  <div id="proof-title">📸 הוכחות מסירה מהנהג</div>
+  <div id="proof-empty">עדיין לא הועלו צילומים</div>
+  <div id="proof-grid"></div>
 </div>
 
 <div id="notes-section">
   <div id="notes-title">📝 השאר הערות לנהג</div>
   <textarea class="note-input" id="note-text" rows="3" placeholder="לדוגמה: אזור פריקה בכניסה הצדדית, קוד שער 1234..."></textarea>
   <input class="phone-input" id="phone-input" type="tel" placeholder="מספר טלפון ליצירת קשר (אופציונלי)">
-  <label class="photo-label" for="photo-file">
-    📸 הוסף תמונה (אזור פריקה, מיקום הרכב...)
-  </label>
+  <label class="photo-label" for="photo-file">📸 הוסף תמונה (אזור פריקה, מיקום הרכב...)</label>
   <input type="file" id="photo-file" accept="image/*" style="display:none" onchange="previewPhoto(this)">
   <img id="photo-preview" alt="תצוגה מקדימה">
   <button class="send-btn" id="send-btn" onclick="sendNote()">שלח לנהג ✓</button>
@@ -2732,6 +2785,8 @@ body{{background:#0A0A0A;color:#fff;font-family:-apple-system,sans-serif;min-hei
 </div>
 
 <div id="powered">Powered by TruckForce</div>
+
+<div id="lightbox" onclick="this.style.display='none'"><img id="lightbox-img"></div>
 
 <script>
 const TOKEN    = '{token}';
@@ -2748,26 +2803,140 @@ const map = new mapboxgl.Map({{
   attributionControl: false,
 }});
 
-// Truck marker
-const el = document.createElement('div');
-el.innerHTML = '🚛';
-el.style.cssText = 'font-size:30px;filter:drop-shadow(0 0 10px rgba(245,166,35,0.7))';
-const marker = new mapboxgl.Marker(el).setLngLat([34.85,31.85]).addTo(map);
+// Truck marker. Lat/Lng updated each poll; one persistent marker.
+const truckEl = document.createElement('div');
+truckEl.innerHTML = '🚛';
+truckEl.style.cssText = 'font-size:30px;filter:drop-shadow(0 0 10px rgba(245,166,35,0.7))';
+const truckMarker = new mapboxgl.Marker(truckEl).setLngLat([34.85,31.85]).addTo(map);
 
-let firstLoad = true;
+// We re-create stop markers on each fetch (cheap, route doesn't change often).
+let stopMarkers = [];
+let firstLoad   = true;
 
-async function updateLocation() {{
+function renderStops(stops, target) {{
+  // Clear any markers from the previous poll.
+  stopMarkers.forEach(m => m.remove());
+  stopMarkers = [];
+
+  stops.forEach(s => {{
+    if (s.lat == null || s.lng == null) return;
+    const el = document.createElement('div');
+    if (s.is_target) {{
+      // Highlighted target stop: large amber pin with a pulse so the
+      // client can spot themselves immediately on the map.
+      el.innerHTML = '📍';
+      el.style.cssText = 'font-size:32px;filter:drop-shadow(0 0 12px rgba(245,166,35,0.9));animation:pulse 2s infinite;';
+    }} else if (s.status === 'done') {{
+      el.innerHTML = '✓';
+      el.style.cssText = 'width:16px;height:16px;border-radius:50%;background:#22C55E;display:flex;align-items:center;justify-content:center;color:#000;font-size:11px;font-weight:800;border:2px solid #0A0A0A;';
+    }} else if (s.status === 'skipped') {{
+      el.innerHTML = '×';
+      el.style.cssText = 'width:16px;height:16px;border-radius:50%;background:#EF4444;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:800;border:2px solid #0A0A0A;';
+    }} else {{
+      // Pending — anonymized neutral dot, no name shown.
+      el.style.cssText = 'width:14px;height:14px;border-radius:50%;background:#666;border:2px solid #0A0A0A;';
+    }}
+    stopMarkers.push(
+      new mapboxgl.Marker(el).setLngLat([s.lng, s.lat]).addTo(map)
+    );
+  }});
+}}
+
+function renderProofPhotos(photos) {{
+  const grid  = document.getElementById('proof-grid');
+  const empty = document.getElementById('proof-empty');
+  grid.innerHTML = '';
+  if (!photos || photos.length === 0) {{
+    empty.style.display = '';
+    return;
+  }}
+  empty.style.display = 'none';
+  photos.forEach(p => {{
+    const div = document.createElement('div');
+    div.className = 'proof-img';
+    div.innerHTML = `<img src="${{p.url}}" alt="">`;
+    div.onclick = () => {{
+      document.getElementById('lightbox-img').src = p.url;
+      document.getElementById('lightbox').style.display = 'flex';
+    }};
+    grid.appendChild(div);
+  }});
+}}
+
+function renderStatusBadge(status) {{
+  const badge = document.getElementById('status-badge');
+  badge.className = '';
+  if (status === 'done') {{
+    badge.textContent = '✓ נמסר';
+    badge.classList.add('s-done');
+  }} else if (status === 'skipped') {{
+    badge.textContent = '× דולג';
+    badge.classList.add('s-skipped');
+  }} else {{
+    badge.textContent = '⏱ בדרך';
+    badge.classList.add('s-pending');
+  }}
+}}
+
+async function updateData() {{
   try {{
     const res  = await fetch(`${{SITE}}/api/track/${{TOKEN}}/data/`);
+    if (!res.ok) return;
     const data = await res.json();
-    if (!data.location) return;
-    const {{lat, lng}} = data.location;
-    marker.setLngLat([lng, lat]);
-    if (firstLoad) {{
-      map.flyTo({{center:[lng,lat], zoom:13, duration:1500}});
-      firstLoad = false;
+
+    // Truck position
+    if (data.location) {{
+      const {{lat, lng}} = data.location;
+      truckMarker.setLngLat([lng, lat]);
     }}
+
+    // Other stops on the route (anonymized for everyone but target)
+    if (data.route_stops) {{
+      renderStops(data.route_stops, data.target_stop);
+
+      // First-time framing: fit the map to the truck + all stops + the
+      // target. We only do this once so subsequent polls don't yank the
+      // user's pan/zoom around.
+      if (firstLoad) {{
+        const bounds = new mapboxgl.LngLatBounds();
+        if (data.location)  bounds.extend([data.location.lng, data.location.lat]);
+        data.route_stops.forEach(s => {{
+          if (s.lat != null && s.lng != null) bounds.extend([s.lng, s.lat]);
+        }});
+        if (!bounds.isEmpty()) {{
+          map.fitBounds(bounds, {{padding: 60, maxZoom: 14, duration: 1200}});
+        }}
+        firstLoad = false;
+      }}
+    }}
+
+    // Target stop details (header, position, status, driver photos)
+    if (data.target_stop) {{
+      const t = data.target_stop;
+      if (t.site_name) document.getElementById('stop-title').textContent = t.site_name;
+      if (t.position && t.total_stops) {{
+        document.getElementById('position').innerHTML =
+          `המשלוח שלך: <strong>${{t.position}} / ${{t.total_stops}}</strong>`;
+      }}
+      renderStatusBadge(t.status);
+      renderProofPhotos(t.driver_photos);
+      // Hide the notes/photo upload section once delivered — feedback is
+      // moot after the fact, and showing photos-of-the-delivery is what
+      // the client wants at that point.
+      if (t.status === 'done' || t.status === 'skipped') {{
+        document.getElementById('notes-section').style.display = 'none';
+      }}
+    }}
+
+    // Driver name + truck subtitle
     if (data.truck) document.getElementById('truck-sub').textContent = data.truck;
+
+    // Show "Call driver" button when we have a phone number
+    if (data.driver_phone) {{
+      const btn = document.getElementById('call-btn');
+      btn.href = `tel:${{data.driver_phone}}`;
+      btn.style.display = 'inline-block';
+    }}
   }} catch(e) {{ console.error(e); }}
 }}
 
@@ -2777,8 +2946,9 @@ async function updateETA() {{
     const res  = await fetch(`${{SITE}}/api/track/${{TOKEN}}/eta/?stop_id=${{STOP_ID}}`);
     const data = await res.json();
     if (data.eta_min_time && data.eta_max_time) {{
-      document.getElementById('eta-time').textContent = `${{data.eta_min_time}} – ${{data.eta_max_time}}`;
-      document.getElementById('eta-msg').textContent  = data.message || '';
+      document.getElementById('eta-time').textContent =
+        `${{data.eta_min_time}} – ${{data.eta_max_time}}`;
+      document.getElementById('eta-msg').textContent = data.message || '';
     }} else {{
       document.getElementById('eta-msg').textContent = 'ממתין למיקום הנהג...';
     }}
@@ -2835,10 +3005,11 @@ async function sendNote() {{
   }}
 }}
 
-updateLocation();
+// Initial fetch + polling.
+updateData();
 updateETA();
-setInterval(updateLocation, 30000);
-setInterval(updateETA,      60000);
+setInterval(updateData, 30000);  // truck position + photos every 30s
+setInterval(updateETA,  60000);  // ETA recompute every 60s
 </script>
 </body>
 </html>'''
@@ -2848,11 +3019,23 @@ setInterval(updateETA,      60000);
 @require_GET
 def tracking_data(request, token):
     """
-    Returns JSON with driver's current location + stop info.
-    No auth required — public endpoint for the tracking page.
+    Returns JSON with driver's current location + route context.
+
+    The returned shape is designed for a client-facing tracking page:
+
+    - `location` is the live truck position (polled every 30s).
+    - `route_stops` is an ordered, ANONYMIZED list of every stop on the
+      route so the page can draw "I'm 3rd of 5" dots on the map without
+      leaking other clients' names/addresses. Only the targeted stop
+      (link.target_stop) carries its real site_name/address.
+    - `target_stop` describes the link's own stop in detail, including
+      its position (1-of-N), status, and any delivery photos the driver
+      has already uploaded so the client can verify their goods.
+
+    No auth required — public endpoint.
     """
     try:
-        link = TrackingLink.objects.select_related('driver').get(token=token)
+        link = TrackingLink.objects.select_related('driver', 'target_stop').get(token=token)
     except TrackingLink.DoesNotExist:
         return JsonResponse({'error': 'Not found'}, status=404)
 
@@ -2862,33 +3045,104 @@ def tracking_data(request, token):
     driver = link.driver
     today  = localdate()
 
-    # Latest location
+    # Latest GPS — drives the truck marker on the map.
     latest = DriverLocation.objects.filter(driver=driver).first()
 
-    # Today's schedule
+    truck = None
+    route_stops = []
+    target_data = None
+
     try:
-        schedule = DailySchedule.objects.get(driver=driver, date=today)
-        truck = f"{schedule.truck.brand} {schedule.truck.model} · {schedule.truck.plate_number}" if schedule.truck else None
-        # Current pending stop
-        current_stop = schedule.stops.filter(status='pending').order_by('order').first()
-        stop_data = {
-            'site_name': current_stop.site_name,
-            'address':   current_stop.address,
-            'order':     current_stop.order,
-        } if current_stop else None
+        schedule = DailySchedule.objects.prefetch_related('stops').get(
+            driver=driver, date=today,
+        )
     except DailySchedule.DoesNotExist:
-        truck     = None
-        stop_data = None
+        schedule = None
+
+    if schedule:
+        if schedule.truck:
+            truck = (f"{schedule.truck.brand} {schedule.truck.model} · "
+                     f"{schedule.truck.plate_number}")
+
+        # All stops on the route, ordered. We expose coords + order + status
+        # for every stop (so the page can draw dots and compute "3 of 5"),
+        # but withhold site_name and address for stops other than the
+        # link's target — that preserves privacy for the other clients
+        # sharing this driver's route.
+        target_id = link.target_stop_id
+        for s in schedule.stops.all().order_by('order'):
+            is_target = (s.id == target_id) if target_id else False
+            route_stops.append({
+                'id':        s.id,
+                'order':     s.order,
+                'status':    s.status,
+                'lat':       float(s.latitude)  if s.latitude  else None,
+                'lng':       float(s.longitude) if s.longitude else None,
+                'is_target': is_target,
+                # Only target stop reveals its name & address; others stay anonymous.
+                'site_name': s.site_name if is_target else None,
+                'address':   s.address   if is_target else None,
+            })
+
+        # Detailed payload for the targeted stop — drives the header text,
+        # status banner, and "proof photos so far" gallery on the page.
+        target_stop = link.target_stop
+        if target_stop:
+            # Position in the route (1-indexed for friendly display).
+            position = next((i + 1 for i, s in enumerate(route_stops)
+                             if s['id'] == target_stop.id), None)
+            # Driver-uploaded delivery photos for THIS stop (proof that the
+            # client's goods are loaded / dropped off). _abs_url-safe because
+            # StopPhoto.image goes through Cloudinary storage which returns
+            # absolute URLs already.
+            driver_photos = []
+            for p in target_stop.photos.all().order_by('uploaded_at'):
+                try:
+                    url = p.image.url if p.image else None
+                except (ValueError, AttributeError):
+                    url = None
+                if url:
+                    driver_photos.append({
+                        'id':          p.id,
+                        'url':         url,
+                        'uploaded_at': p.uploaded_at.isoformat(),
+                    })
+            target_data = {
+                'id':            target_stop.id,
+                'site_name':     target_stop.site_name,
+                'address':       target_stop.address,
+                'order':         target_stop.order,
+                'position':      position,
+                'total_stops':   len(route_stops),
+                'status':        target_stop.status,
+                'driver_photos': driver_photos,
+            }
+        else:
+            # No specific target — fall back to next pending stop for context.
+            cur = schedule.stops.filter(status='pending').order_by('order').first()
+            if cur:
+                target_data = {
+                    'id':            cur.id,
+                    'site_name':     cur.site_name,
+                    'address':       cur.address,
+                    'order':         cur.order,
+                    'position':      cur.order,
+                    'total_stops':   len(route_stops),
+                    'status':        cur.status,
+                    'driver_photos': [],
+                }
 
     return JsonResponse({
         'driver': driver.full_name,
+        'driver_phone': driver.phone,
         'truck':  truck,
         'location': {
             'lat':       float(latest.latitude),
             'lng':       float(latest.longitude),
             'timestamp': latest.timestamp.isoformat(),
         } if latest else None,
-        'current_stop': stop_data,
+        'route_stops': route_stops,
+        'target_stop': target_data,
         'label': link.label,
     })
 
@@ -2934,23 +3188,68 @@ class TrackingLinkListCreateView(APIView):
         return Response(data)
 
     def post(self, request):
-        driver_id = request.data.get('driver_id')
-        label     = request.data.get('label', '')
-        hours     = int(request.data.get('hours', 24))
+        """Create a public tracking link.
+
+        Body:
+            driver_id       (required) — whose route to expose
+            target_stop_id  (optional) — pin to a specific stop, used for
+                                          the page header + ETA + privacy
+            label           (optional) — friendly note for manager UI
+            hours           (optional) — explicit lifetime in hours; if
+                                          omitted, defaults to "end of the
+                                          delivery day" — typically the
+                                          target stop's date or today.
+        """
+        driver_id      = request.data.get('driver_id')
+        target_stop_id = request.data.get('target_stop_id')
+        label          = request.data.get('label', '')
+        hours_raw      = request.data.get('hours')
 
         try:
             driver = Driver.objects.get(pk=driver_id)
         except Driver.DoesNotExist:
             return Response({'error': 'Driver not found'}, status=404)
 
-        link = TrackingLink.generate(
-            driver=driver,
-            manager=request.manager,
-            label=label,
-            hours=hours,
+        target_stop = None
+        if target_stop_id:
+            try:
+                target_stop = Stop.objects.select_related('schedule').get(
+                    pk=target_stop_id,
+                )
+            except Stop.DoesNotExist:
+                return Response({'error': 'Stop not found'}, status=404)
+
+        # Compute expiry. If caller passes `hours`, honour it (back-compat
+        # with the old contract). Otherwise default to midnight at the END
+        # of the delivery day — so a link generated Mon morning for a Mon
+        # delivery dies at Mon 23:59:59, not Tue afternoon.
+        from datetime import datetime, time, timedelta
+        if hours_raw is not None:
+            try:
+                hours = int(hours_raw)
+                expires_at = tz.now() + timedelta(hours=hours)
+            except (TypeError, ValueError):
+                return Response({'error': 'hours must be an integer'}, status=400)
+        else:
+            day = target_stop.schedule.date if target_stop else tz.localdate()
+            # End-of-day in the project's local timezone, then make aware.
+            naive_eod = datetime.combine(day, time(23, 59, 59))
+            expires_at = tz.make_aware(naive_eod) if tz.is_naive(naive_eod) else naive_eod
+
+        link = TrackingLink.objects.create(
+            driver      = driver,
+            created_by  = request.manager,
+            target_stop = target_stop,
+            label       = label,
+            expires_at  = expires_at,
         )
         url = _build_tracking_url(request, link.token)
-        return Response({'ok': True, 'token': link.token, 'url': url}, status=201)
+        return Response({
+            'ok':         True,
+            'token':      link.token,
+            'url':        url,
+            'expires_at': link.expires_at.isoformat(),
+        }, status=201)
 
 
 class TrackingLinkRevokeView(APIView):
