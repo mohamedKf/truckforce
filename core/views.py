@@ -509,8 +509,8 @@ class ScheduleDetailView(APIView):
 
         try:
             from .firebase import _log_and_send_driver
-            title = "🗓️ Schedule Cancelled"
-            body  = f"Your schedule for {date.strftime('%d/%m/%Y')} has been cancelled"
+            title = "🗓️ סידור עבודה בוטל"
+            body  = f"הסידור שלך לתאריך {date.strftime('%d/%m/%Y')} בוטל"
             data  = {
                 "type": "schedule_cancelled",
                 "date": date.isoformat(),
@@ -549,11 +549,13 @@ def _schedule_change_summary(before: int, after: int) -> str:
     """Short human phrase describing how the stops list changed."""
     if after > before:
         n = after - before
-        return f"{n} new stop{'s' if n != 1 else ''} added"
+        word = "עצירה" if n == 1 else "עצירות"
+        return f"נוספה {word}" if n == 1 else f"נוספו {n} {word}"
     if after < before:
         n = before - after
-        return f"{n} stop{'s' if n != 1 else ''} removed"
-    return "stops updated"
+        word = "עצירה" if n == 1 else "עצירות"
+        return f"הוסרה {word}" if n == 1 else f"הוסרו {n} {word}"
+    return "פרטי העצירות עודכנו"
 
 
 class DriverTodayScheduleView(APIView):

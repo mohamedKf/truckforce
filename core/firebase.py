@@ -278,8 +278,8 @@ def _log_and_send_manager(
 # ─── Existing notifications (preserved API, now actually delivering) ───
 
 def notify_manager_stop_skipped(manager, driver, stop) -> bool:
-    title = "⚠️ Stop Skipped"
-    body  = f"{driver.full_name} skipped: {stop.site_name}"
+    title = "⚠️ עצירה דולגה"
+    body  = f"{driver.full_name} דילג על: {stop.site_name}"
     data  = {
         "type":      "stop_skipped",
         "stop_id":   stop.id,
@@ -292,8 +292,8 @@ def notify_manager_day_summary(manager, driver, schedule) -> bool:
     missed = schedule.stops.filter(status='skipped').count()
     total  = schedule.stops.count()
     done   = schedule.stops.filter(status='done').count()
-    title  = f"📋 Day Summary – {driver.full_name}"
-    body   = f"Done: {done}/{total} stops. Missed: {missed}."
+    title  = f"📋 סיכום יום – {driver.full_name}"
+    body   = f"בוצעו: {done}/{total} עצירות. דולגו: {missed}."
     data   = {
         "type":        "day_summary",
         "schedule_id": schedule.id,
@@ -304,8 +304,8 @@ def notify_manager_day_summary(manager, driver, schedule) -> bool:
 
 
 def notify_driver_payslip_ready(driver, payroll) -> bool:
-    title = "💰 Payslip Ready"
-    body  = f"Your payslip for {payroll.month}/{payroll.year} is ready."
+    title = "💰 תלוש שכר מוכן"
+    body  = f"תלוש השכר שלך לחודש {payroll.month}/{payroll.year} מוכן."
     data  = {
         "type":       "payslip_ready",
         "payroll_id": payroll.id,
@@ -319,9 +319,12 @@ def notify_driver_schedule_assigned(driver, schedule) -> bool:
     """Driver receives a new daily schedule (first time today)."""
     stops_count = schedule.stops.count()
     date_str = schedule.date.strftime('%d/%m/%Y')
-    title = "🗓️ New Schedule Assigned"
-    body  = (f"You have {stops_count} stop{'s' if stops_count != 1 else ''} "
-             f"for {date_str}")
+    title = "🗓️ סידור עבודה חדש"
+    # Hebrew has 3 grammatical numbers in casual use: 1 / 2 / many.
+    # We use simple binary singular/plural since "1 עצירה" vs "N עצירות"
+    # is the standard distinction drivers will see.
+    word = "עצירה" if stops_count == 1 else "עצירות"
+    body  = f"יש לך {stops_count} {word} לתאריך {date_str}"
     data  = {
         "type":        "schedule_assigned",
         "schedule_id": schedule.id,
@@ -334,8 +337,8 @@ def notify_driver_schedule_assigned(driver, schedule) -> bool:
 def notify_driver_schedule_updated(driver, schedule, change_summary: str) -> bool:
     """Driver's existing schedule was modified (stops added/removed/changed)."""
     date_str = schedule.date.strftime('%d/%m/%Y')
-    title = "🔄 Schedule Updated"
-    body  = f"Your schedule for {date_str}: {change_summary}"
+    title = "🔄 סידור העבודה עודכן"
+    body  = f"הסידור שלך לתאריך {date_str}: {change_summary}"
     data  = {
         "type":        "schedule_updated",
         "schedule_id": schedule.id,
