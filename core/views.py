@@ -3272,6 +3272,47 @@ class TrackingLinkRevokeView(APIView):
 from django.utils import timezone as tz
 
 
+def _compute_violations(ordered_stop_ids, leg_durations_min, all_stops,
+                        schedule_date, dwell_min=10):
+    """Walk a chosen visit order and flag any windowed stops we'd arrive
+    at AFTER their `expected_arrival`. Returns a list of dicts the UI can
+    show as "this stop will be late by N minutes" warnings.
+
+    Args:
+        ordered_stop_ids:   chosen stop IDs in visit order
+        leg_durations_min:  travel time per leg, in minutes (parallel list)
+        all_stops:          queryset/list of all candidate Stop objects
+                            (so we can look up expected_arrival, site_name)
+        schedule_date:      the schedule's date — combined with the
+                            TimeField to get a real datetime
+        dwell_min:          minutes spent at each stop (matches the
+                            optimizer's assumption)
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    lookup = {s.id: s for s in all_stops}
+    violations = []
+    cur = tz.now()
+    for i, sid in enumerate(ordered_stop_ids):
+        stop = lookup.get(sid)
+        if stop is None:
+            continue
+        leg_min = leg_durations_min[i] if i < len(leg_durations_min) else 0
+        cur = cur + _td(minutes=leg_min)
+        if stop.expected_arrival:
+            naive = _dt.combine(schedule_date, stop.expected_arrival)
+            expected_dt = tz.make_aware(naive) if tz.is_naive(naive) else naive
+            if cur > expected_dt:
+                violations.append({
+                    'stop_id':       sid,
+                    'site_name':     stop.site_name,
+                    'expected':      stop.expected_arrival.strftime('%H:%M'),
+                    'predicted':     cur.strftime('%H:%M'),
+                    'delay_minutes': round((cur - expected_dt).total_seconds() / 60),
+                })
+        cur = cur + _td(minutes=dwell_min)
+    return violations
+
+
 class OptimizeRouteView(APIView):
     """
     POST /api/schedules/<pk>/optimize/
@@ -3347,23 +3388,30 @@ class OptimizeRouteView(APIView):
             driver_lat = float(first.latitude) if first.latitude else 31.85
             driver_lng = float(first.longitude) if first.longitude else 34.85
 
-        # Run Mapbox optimization (works for both modes — deadlines mode just
-        # post-processes the result).
-        from .route_optimizer import optimize_route, apply_deadline_constraints
-        result = optimize_route(driver_lat, driver_lng, stops)
+        # Run the new nearest-neighbor optimizer. It takes a single call
+        # to Mapbox Matrix and walks stop-by-stop, picking the closest
+        # unvisited each step — deterministic and intuitive. When the
+        # manager picked 'deadlines' mode we also let windowed stops cut
+        # the line if their slack is < 30 min.
+        from .route_optimizer import optimize_route
+        result = optimize_route(
+            driver_lat, driver_lng, stops,
+            deadline_aware=(mode == 'deadlines'),
+            schedule_date=schedule.date,
+        )
 
         if result.get('error') and not result.get('ordered_stop_ids'):
             return Response({'error': result['error']}, status=500)
 
-        # If the user asked for deadlines, layer a deadline-aware reorder on top.
-        # We only do this when at least one stop has an `expected_arrival` set,
-        # otherwise there's nothing to respect and Mapbox's result is fine.
-        deadline_violations = []
-        if mode == 'deadlines':
-            result, deadline_violations = apply_deadline_constraints(
-                result, stops, driver_lat, driver_lng,
-                schedule_date=schedule.date,
-            )
+        # The new optimizer computes deadline-related decisions internally,
+        # but we still want to surface any violations to the driver so the
+        # preview dialog can warn "stop X will be late". Compute them here
+        # by walking the chosen order.
+        deadline_violations = _compute_violations(
+            result.get('ordered_stop_ids', []),
+            result.get('durations', []),
+            stops, schedule.date,
+        )
 
         # Save suggestion to schedule. Skip the geometry — it's not needed
         # for re-display and bloats the JSON column. If we ever want to draw

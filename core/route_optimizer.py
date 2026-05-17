@@ -10,99 +10,248 @@ from django.conf import settings
 MAPBOX_TOKEN = getattr(settings, 'MAPBOX_TOKEN', '')
 
 
-def optimize_route(driver_lat, driver_lng, stops):
-    """
-    Optimize stop order using Mapbox Optimization API.
+def optimize_route(driver_lat, driver_lng, stops, deadline_aware=False, schedule_date=None):
+    """Pick the next-closest stop, repeatedly.
+
+    This is a deterministic nearest-neighbor algorithm. Starting from the
+    driver's GPS location, we ask Mapbox for the full travel-time matrix
+    between every point (driver + all stops). Then we greedily pick the
+    closest unvisited stop, jump to it, and repeat until done.
+
+    Why nearest-neighbor and not Mapbox's own /optimized-trips endpoint?
+    Two reasons:
+      1. Drivers think about routes this way: "what's closest from here?"
+         The result is intuitive and predictable. Mapbox's TSP solver can
+         shuffle stops in surprising orders.
+      2. Same input always produces the same output. Mapbox's optimization
+         occasionally returns different orders for the same input — bad
+         for a manager comparing routes side by side.
 
     Args:
-        driver_lat: current driver latitude
-        driver_lng: current driver longitude
-        stops: list of Stop objects with latitude/longitude
+        driver_lat, driver_lng: starting GPS position
+        stops: list of Stop ORM objects (need .id, .latitude, .longitude;
+               optionally .expected_arrival for deadline-aware mode)
+        deadline_aware: when True, a stop with `expected_arrival` will
+               jump the queue if its time window is at risk (< 30 min
+               buffer) — see _pick_next() for details
+        schedule_date: required when deadline_aware=True so we can
+               combine TimeField with date into real datetimes
 
     Returns:
         dict with:
-            - ordered_stop_ids: list of stop IDs in optimal order
-            - durations: list of estimated minutes between stops
-            - total_duration_minutes: total trip duration
-            - waypoints: list of {lat, lng, stop_id}
-            - error: error message if failed
+            - ordered_stop_ids: list of stop IDs in chosen visit order
+            - durations: per-leg minutes (parallel to ordered_stop_ids)
+            - total_duration_minutes: sum of all legs + per-stop dwell
+            - method: 'matrix_nearest_neighbor' on success, fallback name
+                     otherwise
+            - error: None on success, message on failure
     """
-    if not MAPBOX_TOKEN:
-        return {'error': 'Mapbox token not configured', 'ordered_stop_ids': [s.id for s in stops]}
-
-    # Filter stops that have coordinates
+    # Filter stops that have coordinates — anything without lat/lng can't
+    # be on the map, much less optimized.
     valid_stops = [s for s in stops if s.latitude and s.longitude]
     if not valid_stops:
-        return {'error': 'No stops have GPS coordinates', 'ordered_stop_ids': [s.id for s in stops]}
+        return {
+            'error': 'No stops have GPS coordinates',
+            'ordered_stop_ids': [s.id for s in stops],
+            'durations': [],
+            'total_duration_minutes': 0,
+            'method': 'no_coords',
+        }
 
-    # Build coordinates string: driver location first, then all stops
-    coords = [f"{driver_lng},{driver_lat}"]
+    if not MAPBOX_TOKEN:
+        # No token — fall back to straight-line nearest-neighbor so the
+        # feature still works offline / in tests.
+        print("[ROUTE] No Mapbox token, using haversine nearest-neighbor", flush=True)
+        return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
+
+    # Mapbox Matrix API caps at 25 coordinates per call. With driver + N
+    # stops, that's 24 stops max per route. Realistic for daily delivery
+    # routes; if someone has 30 stops we cleanly fall back to haversine.
+    if len(valid_stops) + 1 > 25:
+        print(f"[ROUTE] {len(valid_stops)} stops exceeds Matrix limit (25), "
+              f"falling back to haversine", flush=True)
+        return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
+
+    # Build the coordinate list. Index 0 = driver start, 1..N = stops in
+    # the order they appear in valid_stops (we'll permute later).
+    coords = [(driver_lng, driver_lat)]
     for s in valid_stops:
-        coords.append(f"{float(s.longitude)},{float(s.latitude)}")
+        coords.append((float(s.longitude), float(s.latitude)))
 
-    coordinates = ";".join(coords)
+    matrix = _fetch_driving_matrix(coords)
+    if matrix is None:
+        print("[ROUTE] Matrix API failed, falling back to haversine", flush=True)
+        return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
 
-    # Mapbox Optimization API
-    url = f"https://api.mapbox.com/optimized-trips/v1/mapbox/driving/{coordinates}"
-    params = {
-        'access_token':      MAPBOX_TOKEN,
-        'source':            'first',   # Start from driver location
-        'destination':       'last',    # End at last stop
-        'roundtrip':         'false',
-        'geometries':        'geojson',
-        'overview':          'simplified',
+    # Now run nearest-neighbor against the matrix. Optionally tilt picks
+    # toward windowed stops with tight deadlines.
+    ordered_indices, leg_durations_sec = _nearest_neighbor_on_matrix(
+        matrix,
+        valid_stops,
+        deadline_aware=deadline_aware,
+        schedule_date=schedule_date,
+    )
+
+    # Translate matrix indices (1..N) back to Stop ORM objects.
+    ordered_stop_ids = [valid_stops[i - 1].id for i in ordered_indices]
+    leg_durations    = [round(s / 60) for s in leg_durations_sec]
+    # 10 minutes dwell at each stop — matches our ETA assumption elsewhere.
+    DWELL_PER_STOP_MIN = 10
+    total_min = sum(leg_durations) + DWELL_PER_STOP_MIN * len(ordered_stop_ids)
+
+    print(f"[ROUTE] NN-on-matrix: {len(valid_stops)} stops, "
+          f"{total_min} min total (deadline_aware={deadline_aware})",
+          flush=True)
+
+    return {
+        'ordered_stop_ids':       ordered_stop_ids,
+        'durations':              leg_durations,
+        'total_duration_minutes': total_min,
+        'geometry':               None,  # Matrix API doesn't return polylines
+        'method':                 'matrix_nearest_neighbor',
+        'error':                  None,
     }
 
+
+def _fetch_driving_matrix(coords):
+    """Call Mapbox Matrix API once for all-to-all driving durations.
+
+    Args:
+        coords: list of (lng, lat) tuples, max 25
+
+    Returns:
+        A 2D list `m[i][j] = seconds to drive from coords[i] to coords[j]`,
+        or None on any error so the caller can fall back.
+    """
+    coord_str = ";".join(f"{lng},{lat}" for lng, lat in coords)
+    url = f"https://api.mapbox.com/directions-matrix/v1/mapbox/driving/{coord_str}"
+    params = {
+        'access_token': MAPBOX_TOKEN,
+        # 'annotations=duration' is the default but being explicit helps
+        # avoid accidental quota usage if defaults change upstream.
+        'annotations':  'duration',
+    }
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-
         if data.get('code') != 'Ok':
-            print(f"[ROUTE] Mapbox error: {data.get('code')} — {data.get('message')}", flush=True)
-            # Fallback to nearest neighbor
-            return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
-
-        # Extract waypoint order from response
-        waypoints = data.get('waypoints', [])
-        trips     = data.get('trips', [])
-
-        if not trips:
-            return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
-
-        trip     = trips[0]
-        duration = trip.get('duration', 0) / 60  # seconds → minutes
-
-        # waypoints[0] is driver start, waypoints[1:] are stops in optimal order
-        # waypoint_index tells us original position, trips give us the ordered waypoints
-        ordered_indices = [w.get('waypoint_index', i) for i, w in enumerate(waypoints)]
-
-        # Map back to stop IDs (skip index 0 which is driver location)
-        ordered_stop_ids = []
-        leg_durations    = []
-        legs = trip.get('legs', [])
-
-        for i, leg in enumerate(legs):
-            wp_idx = ordered_indices[i + 1] - 1  # -1 because driver is index 0
-            if 0 <= wp_idx < len(valid_stops):
-                ordered_stop_ids.append(valid_stops[wp_idx].id)
-                leg_durations.append(round(leg.get('duration', 0) / 60))
-
-        print(f"[ROUTE] Optimized {len(valid_stops)} stops in {round(duration)} min", flush=True)
-
-        return {
-            'ordered_stop_ids':      ordered_stop_ids,
-            'durations':             leg_durations,
-            'total_duration_minutes': round(duration),
-            'geometry':              trip.get('geometry'),
-            'error':                 None,
-        }
-
+            print(f"[ROUTE] Matrix API error: {data.get('code')} — "
+                  f"{data.get('message')}", flush=True)
+            return None
+        durations = data.get('durations')
+        if not durations or len(durations) != len(coords):
+            return None
+        # Sanity check — durations may contain None for unreachable pairs
+        # (e.g. islands without ferry data). Replace with a large penalty
+        # so nearest-neighbor still picks something rather than crashing.
+        BIG = 10 ** 9
+        cleaned = [
+            [(BIG if v is None else float(v)) for v in row]
+            for row in durations
+        ]
+        return cleaned
     except requests.exceptions.Timeout:
-        print("[ROUTE] Mapbox timeout — falling back to nearest neighbor", flush=True)
-        return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
+        print("[ROUTE] Matrix API timeout", flush=True)
+        return None
     except Exception as e:
-        print(f"[ROUTE] Error: {e} — falling back to nearest neighbor", flush=True)
-        return _nearest_neighbor(driver_lat, driver_lng, valid_stops)
+        print(f"[ROUTE] Matrix API exception: {e}", flush=True)
+        return None
+
+
+def _nearest_neighbor_on_matrix(matrix, valid_stops, deadline_aware=False,
+                                schedule_date=None,
+                                deadline_buffer_min=30):
+    """Run nearest-neighbor against a pre-computed travel-time matrix.
+
+    Indices: matrix[0] is driver start, matrix[1..N] are stops (matching
+    valid_stops[0..N-1]). We start at index 0 and visit every other index
+    exactly once, picking the lowest travel time each step.
+
+    Deadline behaviour (only when `deadline_aware=True`):
+        Before picking the regular nearest, we check whether any unvisited
+        stop with an `expected_arrival` time is at risk of being missed —
+        defined as "less than `deadline_buffer_min` minutes of slack
+        remaining if we waited any longer". If yes, we jump straight to
+        the most-urgent such stop instead of the nearest one.
+
+    Returns:
+        (ordered_indices, leg_durations_seconds)
+            ordered_indices  — visit order using matrix indices (1..N)
+            leg_durations_seconds — parallel list of travel time per leg
+    """
+    from django.utils import timezone as tz
+    from datetime import datetime as _dt, timedelta as _td
+
+    n_stops = len(valid_stops)
+    unvisited = set(range(1, n_stops + 1))  # matrix indices 1..N
+    ordered = []
+    leg_durations = []
+
+    current = 0  # start at driver
+    cur_time = tz.now() if deadline_aware else None
+    DWELL_MIN = 10
+
+    while unvisited:
+        nearest_idx = min(unvisited, key=lambda i: matrix[current][i])
+        chosen = nearest_idx
+
+        # Deadline override: if a windowed stop is at risk, take it now.
+        if deadline_aware and schedule_date is not None:
+            urgent = _find_urgent_stop(
+                unvisited, matrix, current, cur_time,
+                valid_stops, schedule_date, deadline_buffer_min,
+            )
+            if urgent is not None:
+                chosen = urgent
+
+        leg_sec = matrix[current][chosen]
+        ordered.append(chosen)
+        leg_durations.append(leg_sec)
+        unvisited.discard(chosen)
+
+        # Advance the simulated clock for the next deadline check.
+        if deadline_aware and cur_time is not None:
+            cur_time = cur_time + _td(seconds=leg_sec) + _td(minutes=DWELL_MIN)
+
+        current = chosen
+
+    return ordered, leg_durations
+
+
+def _find_urgent_stop(unvisited, matrix, current, cur_time, valid_stops,
+                      schedule_date, deadline_buffer_min):
+    """Return the matrix-index of the most-urgent windowed stop, if any
+    deadline is at risk of being missed. Otherwise return None.
+
+    "At risk" means: if we picked this stop NOW, we'd arrive with less
+    than `deadline_buffer_min` minutes to spare (or already be late).
+
+    Among at-risk stops we pick the one with the EARLIEST deadline —
+    skipping it would be unrecoverable; skipping a later-deadline stop
+    leaves more flexibility.
+    """
+    from django.utils import timezone as tz
+    from datetime import datetime as _dt, timedelta as _td
+
+    best_idx = None
+    best_deadline = None
+    for idx in unvisited:
+        stop = valid_stops[idx - 1]
+        if not stop.expected_arrival:
+            continue
+        # Combine schedule date + TimeField into a tz-aware datetime
+        naive = _dt.combine(schedule_date, stop.expected_arrival)
+        deadline_dt = tz.make_aware(naive) if tz.is_naive(naive) else naive
+        # Predicted arrival if we drove straight to this stop now
+        arrive_dt = cur_time + _td(seconds=matrix[current][idx])
+        slack_min = (deadline_dt - arrive_dt).total_seconds() / 60
+        if slack_min < deadline_buffer_min:
+            # Among at-risk stops, take the earliest deadline
+            if best_deadline is None or deadline_dt < best_deadline:
+                best_deadline = deadline_dt
+                best_idx = idx
+    return best_idx
+
 
 
 def _nearest_neighbor(driver_lat, driver_lng, stops):
