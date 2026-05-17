@@ -343,11 +343,30 @@ class DriverDetailView(APIView):
 
 
 class DriverUpdateFCMView(APIView):
-    """Driver updates their own FCM token after app launch."""
+    """Driver updates their own FCM token after app launch.
+
+    A single physical device only ever has one FCM token. If a different
+    driver previously logged in on the same phone, that driver's record
+    still points at the same token — and would receive notifications meant
+    for nobody. Before we save the token to the current driver, clear it
+    from any *other* driver record so the token belongs to exactly one
+    driver at a time.
+    """
     permission_classes = [IsDriver]
 
     def post(self, request):
         token = request.data.get('fcm_token', '')
+        if token:
+            # Detach this token from any other driver who used to own it.
+            # update() is one SQL statement and doesn't fire signals — fast
+            # and safe even if zero matches.
+            stolen = (Driver.objects
+                      .filter(fcm_token=token)
+                      .exclude(pk=request.driver.pk)
+                      .update(fcm_token=''))
+            if stolen:
+                print(f"[FCM-REGISTER] reclaimed token from {stolen} other driver(s) "
+                      f"for driver={request.driver.id}", flush=True)
         request.driver.fcm_token = token
         request.driver.save(update_fields=['fcm_token'])
         return Response({'detail': 'FCM token updated'})
