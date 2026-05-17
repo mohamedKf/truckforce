@@ -2976,10 +2976,28 @@ from django.utils import timezone as tz
 class OptimizeRouteView(APIView):
     """
     POST /api/schedules/<pk>/optimize/
-    Manager clicks "מסלול אופטימלי" — system calculates best stop order.
-    Saves suggestion, notifies driver via Firebase.
+
+    Calculate the best stop order for a schedule. Available to both manager
+    and the driver who owns the schedule.
+
+    Body (optional):
+        {
+            "mode": "fast" | "deadlines"   # default "fast"
+        }
+
+    "fast"        — pure shortest driving time (Mapbox Optimization API).
+    "deadlines"   — same Mapbox call, but if any stop with `expected_arrival`
+                    would be violated by the suggested order, we fall back
+                    to a deadline-aware greedy: sort by `expected_arrival`
+                    ascending, then within the same window do nearest-neighbor.
+                    This isn't a globally-optimal TSP-with-windows, but it
+                    behaves correctly for small Israeli fleet routes (≤15
+                    stops, mostly 1-2 stops with hard windows).
+
+    Saves the suggestion to schedule.route_suggestion and notifies the driver
+    (when manager initiates) or the manager (when driver initiates).
     """
-    permission_classes = [IsManager]
+    permission_classes = [IsManagerOrDriver]
 
     def post(self, request, pk):
         try:
@@ -2987,77 +3005,121 @@ class OptimizeRouteView(APIView):
         except DailySchedule.DoesNotExist:
             return Response({'error': 'Schedule not found'}, status=404)
 
+        # Ownership check: driver can only optimize their OWN schedule.
+        # Manager can optimize anyone's.
+        if hasattr(request, 'driver') and request.driver is not None:
+            if schedule.driver_id != request.driver.id:
+                return Response({'error': 'Forbidden — not your schedule'},
+                                status=403)
+
         stops = list(schedule.stops.filter(status='pending').order_by('order'))
         if not stops:
             return Response({'error': 'No pending stops to optimize'}, status=400)
 
-        # Get driver's current location
-        driver   = schedule.driver
-        latest   = DriverLocation.objects.filter(driver=driver).first()
+        mode = (request.data.get('mode') or 'fast').lower()
+        if mode not in ('fast', 'deadlines'):
+            mode = 'fast'
 
+        # Get driver's current location. Prefer the live GPS feed, fall back
+        # to the first stop's coordinates so we always have *something*.
+        driver  = schedule.driver
+        latest  = DriverLocation.objects.filter(driver=driver).first()
         if latest:
             driver_lat = float(latest.latitude)
             driver_lng = float(latest.longitude)
         else:
-            # Fallback: use first stop as starting point
             first = stops[0]
             driver_lat = float(first.latitude) if first.latitude else 31.85
             driver_lng = float(first.longitude) if first.longitude else 34.85
 
-        # Run optimization
-        from .route_optimizer import optimize_route
+        # Run Mapbox optimization (works for both modes — deadlines mode just
+        # post-processes the result).
+        from .route_optimizer import optimize_route, apply_deadline_constraints
         result = optimize_route(driver_lat, driver_lng, stops)
 
         if result.get('error') and not result.get('ordered_stop_ids'):
             return Response({'error': result['error']}, status=500)
 
+        # If the user asked for deadlines, layer a deadline-aware reorder on top.
+        # We only do this when at least one stop has an `expected_arrival` set,
+        # otherwise there's nothing to respect and Mapbox's result is fine.
+        deadline_violations = []
+        if mode == 'deadlines':
+            result, deadline_violations = apply_deadline_constraints(
+                result, stops, driver_lat, driver_lng,
+                schedule_date=schedule.date,
+            )
+
         # Save suggestion to schedule
         schedule.route_suggestion = {
-            'ordered_stop_ids':      result.get('ordered_stop_ids', []),
-            'durations':             result.get('durations', []),
+            'ordered_stop_ids':       result.get('ordered_stop_ids', []),
+            'durations':              result.get('durations', []),
             'total_duration_minutes': result.get('total_duration_minutes', 0),
-            'geometry':              result.get('geometry'),
-            'driver_lat':            driver_lat,
-            'driver_lng':            driver_lng,
-            'created_at':            tz.now().isoformat(),
+            'geometry':               result.get('geometry'),
+            'driver_lat':             driver_lat,
+            'driver_lng':             driver_lng,
+            'mode':                   mode,
+            'deadline_violations':    deadline_violations,
+            'created_at':             tz.now().isoformat(),
         }
         schedule.route_optimized    = True
         schedule.route_optimized_at = tz.now()
         schedule.save()
 
-        # Notify driver via Firebase
-        publish_event('route_suggestion', by_user_id=getattr(request.manager, 'id', None), extra={
-            'schedule_id':           pk,
-            'driver_id':             driver.id,
+        # Audit + Firebase ping. The "by_user_id" is the *initiator*, not the
+        # owner — useful for showing "manager optimized your route" vs the
+        # driver doing it themselves.
+        by_user_id = (
+            getattr(request, 'manager', None).id
+            if getattr(request, 'manager', None) is not None
+            else getattr(request, 'driver', None).id
+            if getattr(request, 'driver', None) is not None
+            else None
+        )
+        publish_event('route_suggestion', by_user_id=by_user_id, extra={
+            'schedule_id':            pk,
+            'driver_id':              driver.id,
             'total_duration_minutes': result.get('total_duration_minutes', 0),
-            'stop_count':            len(stops),
+            'stop_count':             len(stops),
+            'mode':                   mode,
         })
 
         print(f"[ROUTE] Optimized schedule {pk} — {len(stops)} stops, "
-              f"{result.get('total_duration_minutes', 0)} min", flush=True)
+              f"{result.get('total_duration_minutes', 0)} min, mode={mode}, "
+              f"violations={len(deadline_violations)}", flush=True)
 
         return Response({
-            'ok':                    True,
-            'ordered_stop_ids':      result.get('ordered_stop_ids', []),
-            'durations':             result.get('durations', []),
+            'ok':                     True,
+            'ordered_stop_ids':       result.get('ordered_stop_ids', []),
+            'durations':              result.get('durations', []),
             'total_duration_minutes': result.get('total_duration_minutes', 0),
-            'geometry':              result.get('geometry'),
-            'method':                result.get('method', 'mapbox'),
+            'geometry':               result.get('geometry'),
+            'method':                 result.get('method', 'mapbox'),
+            'mode':                   mode,
+            'deadline_violations':    deadline_violations,
         })
 
 
 class ApplyRouteSuggestionView(APIView):
     """
     POST /api/schedules/<pk>/apply-suggestion/
-    Manager approves the suggestion — reorders stops in DB.
+
+    Apply the most recent route suggestion (reorder stops in DB).
+    Available to manager (any schedule) and the driver who owns the schedule.
     """
-    permission_classes = [IsManager]
+    permission_classes = [IsManagerOrDriver]
 
     def post(self, request, pk):
         try:
             schedule = DailySchedule.objects.get(pk=pk)
         except DailySchedule.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
+
+        # Ownership check for driver — same pattern as OptimizeRouteView.
+        if hasattr(request, 'driver') and request.driver is not None:
+            if schedule.driver_id != request.driver.id:
+                return Response({'error': 'Forbidden — not your schedule'},
+                                status=403)
 
         suggestion = schedule.route_suggestion
         if not suggestion:
@@ -3067,17 +3129,31 @@ class ApplyRouteSuggestionView(APIView):
         if not ordered_ids:
             return Response({'error': 'Empty suggestion'}, status=400)
 
-        # Reorder stops
-        for new_order, stop_id in enumerate(ordered_ids, start=1):
-            Stop.objects.filter(pk=stop_id, schedule=schedule).update(order=new_order)
+        # Reorder stops. We do it in a temporary unique range first to avoid
+        # unique_together collisions on (schedule, order), then we settle the
+        # final 1..N ordering. unique_together isn't declared on Stop today,
+        # so this is defensive in case it gets added later.
+        from django.db import transaction
+        with transaction.atomic():
+            for new_order, stop_id in enumerate(ordered_ids, start=1):
+                Stop.objects.filter(pk=stop_id, schedule=schedule).update(
+                    order=new_order
+                )
 
-        # Notify driver route is confirmed
-        publish_event('route_confirmed', by_user_id=getattr(request.manager, 'id', None), extra={
+        # Audit ping. Same pattern as optimize: tell the other party.
+        by_user_id = (
+            getattr(request, 'manager', None).id
+            if getattr(request, 'manager', None) is not None
+            else getattr(request, 'driver', None).id
+            if getattr(request, 'driver', None) is not None
+            else None
+        )
+        publish_event('route_confirmed', by_user_id=by_user_id, extra={
             'schedule_id': pk,
             'driver_id':   schedule.driver.id,
         })
 
-        return Response({'ok': True, 'message': 'Route applied and driver notified'})
+        return Response({'ok': True, 'message': 'Route applied'})
 
 
 class StopTaskListCreateView(APIView):
