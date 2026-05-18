@@ -231,6 +231,14 @@ class StopSerializer(serializers.ModelSerializer):
     is_late          = serializers.BooleanField(read_only=True)
     photos           = StopPhotoSerializer(many=True, read_only=True)
 
+    # Pre-uploaded delivery-note PDF, served from Cloudinary. Uploaded
+    # via the dedicated /stops/<pk>/delivery-note/ endpoint to keep
+    # multipart logic out of regular stop CRUD.
+    delivery_note_url = serializers.SerializerMethodField()
+
+    def get_delivery_note_url(self, obj):
+        return _abs_url(obj.delivery_note_pdf, self.context.get('request'))
+
     class Meta:
         model  = Stop
         fields = [
@@ -245,6 +253,7 @@ class StopSerializer(serializers.ModelSerializer):
             'contact_name', 'contact_phone',
             'pickup_stop',
             'driver_note',
+            'delivery_note_url',
         ]
         read_only_fields = ['completed_at', 'actual_arrival']
 

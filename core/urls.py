@@ -58,6 +58,7 @@ urlpatterns = [
     path('stops/<int:pk>/eta-distance/',  views.StopETADistanceView.as_view()),
     path('stop-photos/<int:pk>/',         views.StopPhotoDeleteView.as_view()),
     path('stop-tasks/<int:pk>/',          views.StopTaskDeleteView.as_view()),
+    path('stops/<int:pk>/delivery-note/', views.StopDeliveryNoteView.as_view()),
 
     # ── Attendance — specific before <int:pk> ─────────
     path('attendance/',                   views.AttendanceListView.as_view()),

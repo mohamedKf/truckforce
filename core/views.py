@@ -1947,6 +1947,76 @@ class StopPhotoDeleteView(APIView):
         photo.delete()
         return Response(status=204)
 
+
+class StopDeliveryNoteView(APIView):
+    """POST /api/stops/<pk>/delivery-note/    upload (multipart 'file')
+       DELETE /api/stops/<pk>/delivery-note/  remove
+
+    A "delivery note" is the document the client signs at handover. The
+    manager attaches it from the assignments page when creating or
+    editing a stop; the driver can view it from the app to confirm
+    they're delivering the right paperwork. Later we'll layer signature
+    capture on top and produce a flattened PDF in DeliveryConfirmation.
+
+    Both manager and the assigned driver can upload — useful when a
+    driver receives a paper delivery note and photographs it.
+    """
+    permission_classes = [IsManagerOrDriver]
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def _get_stop(self, request, pk):
+        try:
+            stop = Stop.objects.select_related('schedule').get(pk=pk)
+        except Stop.DoesNotExist:
+            return None, Response({'error': 'Stop not found'}, status=404)
+        # Driver may only touch their own schedule's stops.
+        if hasattr(request, 'driver') and request.driver is not None:
+            if stop.schedule.driver_id != request.driver.id:
+                return None, Response({'error': 'Forbidden'}, status=403)
+        return stop, None
+
+    def post(self, request, pk):
+        stop, err = self._get_stop(request, pk)
+        if err:
+            return err
+        f = request.FILES.get('file') or request.FILES.get('pdf')
+        if not f:
+            return Response({'error': "'file' field required"}, status=400)
+        # Light content-type sanity: we want PDFs in practice, but allow
+        # client tools that send octet-stream by accepting anything
+        # that *looks* like a PDF by its extension. Stronger validation
+        # belongs in a virus scanner, not here.
+        name = (f.name or '').lower()
+        if not name.endswith('.pdf'):
+            return Response({'error': 'PDF file required'}, status=400)
+        # Replace any existing file so the row stays unique.
+        if stop.delivery_note_pdf:
+            try:
+                stop.delivery_note_pdf.delete(save=False)
+            except Exception:
+                pass
+        stop.delivery_note_pdf = f
+        stop.save(update_fields=['delivery_note_pdf'])
+        return Response({
+            'ok':                True,
+            'delivery_note_url': stop.delivery_note_pdf.url
+                                  if stop.delivery_note_pdf else None,
+        }, status=201)
+
+    def delete(self, request, pk):
+        stop, err = self._get_stop(request, pk)
+        if err:
+            return err
+        if stop.delivery_note_pdf:
+            try:
+                stop.delivery_note_pdf.delete(save=False)
+            except Exception:
+                pass
+            stop.delivery_note_pdf = None
+            stop.save(update_fields=['delivery_note_pdf'])
+        return Response(status=204)
+
+
 # ──────────────────────────────────────────────
 # ATTENDANCE FIX REQUESTS
 # ──────────────────────────────────────────────

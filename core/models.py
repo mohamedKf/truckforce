@@ -296,6 +296,18 @@ class Stop(models.Model):
     contact_name = models.CharField(max_length=100, blank=True)
     contact_phone = models.CharField(max_length=20, blank=True)
 
+    # Pre-uploaded delivery-note PDF — the document the client will sign
+    # later. Manager attaches it when creating/editing the stop in the
+    # assignments page. Driver can view it from the app, and once we
+    # build the signature-stamping flow it'll be flattened with the
+    # signature and re-uploaded as a confirmation PDF (DeliveryConfirmation).
+    delivery_note_pdf = models.FileField(
+        upload_to='delivery_notes/',
+        storage=RawMediaCloudinaryStorage(),
+        blank=True, null=True,
+        help_text='פתק משלוח לחתימה ע״י הלקוח'
+    )
+
     # Link delivery stops back to their pickup stop
     pickup_stop = models.ForeignKey(
         'self',
