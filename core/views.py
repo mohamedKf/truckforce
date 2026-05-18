@@ -3714,6 +3714,7 @@ class StopETADistanceView(APIView):
         if not latest:
             return Response({
                 'no_location':    True,
+                'driver_id':      driver.id,
                 'driver_name':    driver.full_name,
                 'driver_phone':   driver.phone,
                 'contact_phone':  stop.contact_phone or '',
@@ -3749,6 +3750,7 @@ class StopETADistanceView(APIView):
         eta_max_time = (now + timedelta(minutes=max_eta)).strftime('%H:%M')
 
         return Response({
+            'driver_id':        driver.id,
             'driver_name':      driver.full_name,
             'driver_phone':     driver.phone,
             'contact_name':     stop.contact_name or '',
