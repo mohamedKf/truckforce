@@ -1989,18 +1989,55 @@ class StopDeliveryNoteView(APIView):
         name = (f.name or '').lower()
         if not name.endswith('.pdf'):
             return Response({'error': 'PDF file required'}, status=400)
-        # Replace any existing file so the row stays unique.
+
+        # Why we bypass Django storage and use the Cloudinary SDK directly:
+        # the Django storage layer has historically produced doubled URLs
+        # in this project (e.g. `…/raw/upload/https://…/raw/upload/file.pdf`),
+        # because some serializer-side helper concatenated an already-
+        # absolute Cloudinary URL onto the storage prefix. Going straight
+        # to the SDK gives us a single canonical URL we control, and we
+        # store only the *secure_url* string on the field. The model's
+        # FileField still works for reads — `.url` just echoes the string
+        # back unchanged when it's already a full URL.
+        try:
+            import cloudinary.uploader
+            result = cloudinary.uploader.upload(
+                f,
+                resource_type='raw',
+                folder='delivery_notes',
+                use_filename=True,
+                unique_filename=True,
+                overwrite=False,
+            )
+        except Exception as e:
+            print(f"[DELIVERY-NOTE] upload failed: {e}", flush=True)
+            return Response({'error': f'Upload failed: {e}'}, status=500)
+
+        secure_url = result.get('secure_url') or result.get('url')
+        if not secure_url:
+            return Response({'error': 'Upload returned no URL'}, status=500)
+
+        # Replace any existing file so the row stays unique. We do this
+        # *after* the new upload succeeds so we never end up with a stop
+        # that has neither the old nor the new file.
         if stop.delivery_note_pdf:
             try:
                 stop.delivery_note_pdf.delete(save=False)
             except Exception:
+                # The previous URL may have been the broken double-prefixed
+                # one — delete() can raise on that. Ignore and move on;
+                # we're about to overwrite the column anyway.
                 pass
-        stop.delivery_note_pdf = f
+
+        # Store the secure URL directly as the file's `name`. Because the
+        # value already starts with `https://`, our `_abs_url` serializer
+        # helper will short-circuit and return it verbatim — no
+        # double-prefixing possible.
+        stop.delivery_note_pdf = secure_url
         stop.save(update_fields=['delivery_note_pdf'])
         return Response({
             'ok':                True,
-            'delivery_note_url': stop.delivery_note_pdf.url
-                                  if stop.delivery_note_pdf else None,
+            'delivery_note_url': secure_url,
         }, status=201)
 
     def delete(self, request, pk):
