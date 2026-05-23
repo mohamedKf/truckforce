@@ -1926,7 +1926,26 @@ class StopPhotoListCreateView(APIView):
         if not image:
             return Response({'error': 'image file required'}, status=400)
 
-        photo = StopPhoto.objects.create(stop=stop, image=image)
+        # Upload via Cloudinary SDK directly to avoid Django storage's
+        # double-URL bug. We store the clean `secure_url` on the field.
+        try:
+            import cloudinary.uploader
+            result = cloudinary.uploader.upload(
+                image,
+                resource_type='image',
+                folder='delivery_photos',
+                use_filename=True,
+                unique_filename=True,
+            )
+        except Exception as e:
+            print(f"[STOP-PHOTO] upload failed: {e}", flush=True)
+            return Response({'error': f'Upload failed: {e}'}, status=500)
+
+        secure_url = result.get('secure_url') or result.get('url')
+        if not secure_url:
+            return Response({'error': 'Upload returned no URL'}, status=500)
+
+        photo = StopPhoto.objects.create(stop=stop, image=secure_url)
         return Response(StopPhotoSerializer(photo).data, status=201)
 
 
@@ -3938,7 +3957,23 @@ class StopCompleteView(APIView):
 
         # Photo (if any) goes via the StopPhoto FK — Stop has no direct photo field.
         if photo:
-            StopPhoto.objects.create(stop=stop, image=photo)
+            try:
+                import cloudinary.uploader
+                result = cloudinary.uploader.upload(
+                    photo,
+                    resource_type='image',
+                    folder='delivery_photos',
+                    use_filename=True,
+                    unique_filename=True,
+                )
+                secure_url = result.get('secure_url') or result.get('url')
+                if secure_url:
+                    StopPhoto.objects.create(stop=stop, image=secure_url)
+                else:
+                    print(f"[STOP-PHOTO] upload returned no URL", flush=True)
+            except Exception as e:
+                print(f"[STOP-PHOTO] upload failed: {e}", flush=True)
+                # Don't fail the whole stop completion just because photo failed
 
         # Log based on stop type
         type_label = dict(Stop.STOP_TYPE_CHOICES).get(stop.stop_type, stop.stop_type)
