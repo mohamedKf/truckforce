@@ -1945,7 +1945,9 @@ class StopPhotoListCreateView(APIView):
         if not secure_url:
             return Response({'error': 'Upload returned no URL'}, status=500)
 
-        photo = StopPhoto.objects.create(stop=stop, image=secure_url)
+        photo = StopPhoto(stop=stop)
+        photo.image = secure_url
+        photo.save()
         return Response(StopPhotoSerializer(photo).data, status=201)
 
 
@@ -3968,7 +3970,9 @@ class StopCompleteView(APIView):
                 )
                 secure_url = result.get('secure_url') or result.get('url')
                 if secure_url:
-                    StopPhoto.objects.create(stop=stop, image=secure_url)
+                    sp = StopPhoto(stop=stop)
+                    sp.image = secure_url
+                    sp.save()
                 else:
                     print(f"[STOP-PHOTO] upload returned no URL", flush=True)
             except Exception as e:
