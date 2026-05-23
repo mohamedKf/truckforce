@@ -2555,8 +2555,12 @@ class DriverPhotoUploadView(APIView):
     parser_classes     = [MultiPartParser, FormParser]
 
     def post(self, request):
-        import base64, os
-        from django.core.files.base import ContentFile
+        # We upload via the Cloudinary SDK directly (NOT through Django's
+        # FileField.save), because RawMediaCloudinaryStorage was building
+        # a doubled URL — wrapping its own already-absolute URL inside
+        # another `…/image/upload/…` prefix. Going SDK-direct gives us one
+        # canonical `secure_url`, which we store as-is on the field.
+        import base64
 
         image_file = request.FILES.get('photo')
         if not image_file:
@@ -2564,31 +2568,58 @@ class DriverPhotoUploadView(APIView):
 
         driver = request.driver
 
-        # Save to media/profile/{driver_id}.jpg (permanent URL)
-        ext  = os.path.splitext(image_file.name)[1] or '.jpg'
-        name = f'{driver.id}{ext}'
-        # Delete old file if exists
+        # 1) Upload directly via Cloudinary SDK
+        try:
+            import cloudinary.uploader
+            result = cloudinary.uploader.upload(
+                image_file,
+                resource_type='image',
+                folder='driver_photos',
+                public_id=str(driver.id),  # stable per-driver id
+                overwrite=True,            # replace previous photo
+                invalidate=True,           # bust Cloudinary CDN cache
+            )
+        except Exception as e:
+            print(f"[DRIVER-PHOTO] upload failed: {e}", flush=True)
+            return Response({'error': f'Upload failed: {e}'}, status=500)
+
+        secure_url = result.get('secure_url') or result.get('url')
+        if not secure_url:
+            return Response({'error': 'Upload returned no URL'}, status=500)
+
+        # 2) Best-effort cleanup of any prior file. We do this AFTER the
+        # new upload succeeds, so the row never has neither old nor new.
         if driver.photo:
             try:
                 driver.photo.delete(save=False)
             except Exception:
+                # Old URL might be a broken double-prefixed one — delete()
+                # can raise on those. We're about to overwrite the field
+                # value anyway, so ignore.
                 pass
-        driver.photo.save(name, image_file, save=False)
 
-        # Also store as base64 for desktop to pick up
+        # 3) Store the full secure URL as the field value. Because it
+        # starts with `https://`, _abs_url in serializers will return it
+        # verbatim — no double-prefixing possible.
+        driver.photo = secure_url
+
+        # 4) Also store base64 for desktop to pick up (legacy fast path).
         image_file.seek(0)
-        raw   = image_file.read()
-        b64   = base64.b64encode(raw).decode('utf-8')
-        mime  = image_file.content_type or 'image/jpeg'
+        raw  = image_file.read()
+        b64  = base64.b64encode(raw).decode('utf-8')
+        mime = image_file.content_type or 'image/jpeg'
         driver.photo_b64 = f'data:{mime};base64,{b64}'
         driver.save(update_fields=['photo', 'photo_b64'])
 
         # Fire Firebase event so desktop knows to download
         publish_event('drivers_changed', by_user_id=driver.id)
 
+        # Return the raw stored value (already a clean https URL) — do NOT
+        # use driver.photo.url because that goes through storage and can
+        # re-wrap into a doubled URL on some Django/Cloudinary versions.
         return Response({
             'ok': True,
-            'photo_url': request.build_absolute_uri(driver.photo.url) if driver.photo else None,
+            'photo_url': str(driver.photo) if driver.photo else None,
         })
 
     def delete(self, request):
