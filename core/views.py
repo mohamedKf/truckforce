@@ -1938,17 +1938,37 @@ class StopPhotoListCreateView(APIView):
                 unique_filename=True,
             )
         except Exception as e:
-            print(f"[STOP-PHOTO] upload failed: {e}", flush=True)
+            import traceback
+            print(f"[STOP-PHOTO] ERROR cloudinary upload:\n{traceback.format_exc()}", flush=True)
             return Response({'error': f'Upload failed: {e}'}, status=500)
 
         secure_url = result.get('secure_url') or result.get('url')
         if not secure_url:
             return Response({'error': 'Upload returned no URL'}, status=500)
 
-        photo = StopPhoto(stop=stop)
-        photo.image = secure_url
-        photo.save()
-        return Response(StopPhotoSerializer(photo).data, status=201)
+        # Save the DB row. Wrapped with a full traceback so that if THIS is
+        # where the 500 was coming from (the file reaches Cloudinary but the
+        # row never saves), the real reason is logged clearly instead of a
+        # blank 500.
+        try:
+            photo = StopPhoto(stop=stop)
+            photo.image = secure_url
+            photo.save()
+        except Exception as e:
+            import traceback
+            print(f"[STOP-PHOTO] ERROR save:\n{traceback.format_exc()}", flush=True)
+            return Response({'error': f'Save failed: {e}'}, status=500)
+
+        # Build the response directly from the clean Cloudinary URL. We do NOT
+        # route the freshly-saved ImageField back through the serializer/_abs_url
+        # here — secure_url is already the final, correct URL, and avoiding the
+        # round-trip removes the other place a 500 could originate.
+        return Response({
+            'id':          photo.id,
+            'stop':        stop.id,
+            'image':       secure_url,
+            'uploaded_at': photo.uploaded_at.isoformat() if photo.uploaded_at else None,
+        }, status=201)
 
 
 class StopPhotoDeleteView(APIView):
@@ -2316,12 +2336,26 @@ class AttendanceFixRequestDecideView(APIView):
         note   = request.data.get('manager_note', '')
 
         if action == 'approve':
+            # The manager may override the driver's requested times before they
+            # are written to attendance. Fall back to the requested values when
+            # a time isn't sent (keeps older clients working unchanged).
+            from django.utils.dateparse import parse_datetime
+            def _parse(val):
+                if not val:
+                    return None
+                dt = parse_datetime(val)
+                if dt and timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt, timezone.get_current_timezone())
+                return dt
+            new_in  = _parse(request.data.get('clock_in'))  or fr.requested_clock_in
+            new_out = _parse(request.data.get('clock_out')) or fr.requested_clock_out
+
             # Apply the changes to the Attendance row
             att, _ = Attendance.objects.get_or_create(driver=fr.driver, date=fr.date)
-            if fr.requested_clock_in is not None:
-                att.clock_in = fr.requested_clock_in
-            if fr.requested_clock_out is not None:
-                att.clock_out = fr.requested_clock_out
+            if new_in is not None:
+                att.clock_in = new_in
+            if new_out is not None:
+                att.clock_out = new_out
             if att.clock_in and att.clock_out:
                 att.calculate_hours()
             att.edited_by = request.manager

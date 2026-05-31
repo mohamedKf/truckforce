@@ -117,6 +117,7 @@ class Driver(models.Model):
     birth_date   = models.DateField(null=True, blank=True)
     hire_date    = models.DateField(null=True, blank=True)
     photo        = models.ImageField(upload_to='driver_photos/', blank=True, null=True,
+                   max_length=500,  # Cloudinary URLs exceed the default 100 chars
                    help_text='Permanent profile photo served via media URL')
     photo_b64    = models.TextField(blank=True, default='',
                    help_text='Temporary base64 upload — desktop downloads and clears this')
@@ -305,6 +306,7 @@ class Stop(models.Model):
         upload_to='delivery_notes/',
         storage=RawMediaCloudinaryStorage(),
         blank=True, null=True,
+        max_length=500,  # Cloudinary URLs exceed the default 100 chars
         help_text='פתק משלוח לחתימה ע״י הלקוח'
     )
 
@@ -357,7 +359,7 @@ class Stop(models.Model):
 class StopPhoto(models.Model):
     """Multiple delivery/proof photos per stop (unlimited)."""
     stop        = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name='photos')
-    image       = models.ImageField(upload_to='delivery_photos/')
+    image       = models.ImageField(upload_to='delivery_photos/', max_length=500)  # long Cloudinary URLs
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -383,10 +385,12 @@ class DeliveryConfirmation(models.Model):
     signed_by_email = models.EmailField(blank=True,
                                          help_text='Email to send confirmation to')
     signature_image = models.ImageField(upload_to='signatures/',
+                                         max_length=500,  # long Cloudinary URLs
                                          help_text='PNG of the hand-drawn signature')
     pdf_file        = models.FileField(upload_to='confirmation_pdfs/',
                                         storage=RawMediaCloudinaryStorage(),
                                         blank=True,
+                                        max_length=500,  # long Cloudinary URLs
                                         help_text='Generated PDF confirmation')
     whatsapp_sent   = models.BooleanField(default=False)
     email_sent      = models.BooleanField(default=False)
@@ -1005,7 +1009,8 @@ class StopTask(models.Model):
     stop       = models.ForeignKey('Stop', on_delete=models.CASCADE, related_name='tasks')
     source     = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='manager')
     note       = models.TextField(blank=True)
-    photo      = models.ImageField(upload_to='stop_task_photos/', null=True, blank=True)
+    photo      = models.ImageField(upload_to='stop_task_photos/', null=True, blank=True,
+                                   max_length=500)  # long Cloudinary URLs
     phone      = models.CharField(max_length=20, blank=True, help_text='Contact phone for driver')
     created_at = models.DateTimeField(auto_now_add=True)
 
