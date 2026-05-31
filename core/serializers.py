@@ -17,32 +17,60 @@ from .models import (
 def _abs_url(field_file, request=None):
     """Return an absolute URL for a FileField/ImageField, defensively.
 
-    Cloudinary's storage backend already returns FULLY-QUALIFIED URLs from
-    `field.url` (e.g. https://res.cloudinary.com/<cloud>/image/upload/<path>).
-    If we naively call `request.build_absolute_uri(url)` on top, certain
-    edge cases (relative-looking inputs after redirects, mis-encoded slashes,
-    paths starting with a single `/`) can produce a doubled prefix like:
+    We store Cloudinary's `secure_url` straight onto the field. The trap:
+    the model uses a plain FileField whose default storage is Cloudinary's
+    *image* storage, so calling `field_file.url` re-wraps the stored value
+    into a doubled URL:
 
-        https://res.cloudinary.com/.../upload/https:/res.cloudinary.com/.../upload/X
+        .../image/upload/https://res.cloudinary.com/<cloud>/raw/upload/<file>
 
-    This helper short-circuits: if the field's URL is already absolute,
-    return it as-is. Only fall back to build_absolute_uri for paths that
-    truly need the Django host (e.g. legacy local-media leftovers).
+    Fix: inspect the RAW stored value (`.name`) FIRST. If it's already a
+    full URL, return it verbatim and never call `.url` (the thing that
+    corrupts it). `_undouble_cloudinary` also repairs any rows whose stored
+    value was corrupted historically.
     """
     if not field_file:
         return None
+
+    # Raw stored value — read it BEFORE touching .url.
+    raw = getattr(field_file, 'name', None) or str(field_file)
+    if raw and raw.startswith(("http://", "https://")):
+        return _undouble_cloudinary(raw)
+
+    # Legacy / local-media path needs the storage URL.
     try:
         url = field_file.url
     except (ValueError, AttributeError):
         return None
     if not url:
         return None
-    # Cloudinary URLs are always absolute. Same for any other full URL.
+    url = _undouble_cloudinary(url)
     if url.startswith(("http://", "https://")):
         return url
-    # Otherwise it's a relative path (e.g. /media/...) — needs absolutizing.
     if request is not None:
         return request.build_absolute_uri(url)
+    return url
+
+
+def _undouble_cloudinary(url):
+    """Repair a doubled Cloudinary URL, e.g.
+        .../image/upload/https://res.cloudinary.com/.../raw/upload/file.pdf
+    Returns the inner absolute URL. Handles the slash-collapsed `https:/`
+    form Cloudinary sometimes emits. No-op for clean URLs.
+    """
+    if not url:
+        return url
+    idx = url.find('/upload/')
+    if idx == -1:
+        return url
+    tail = url[idx + len('/upload/'):]
+    for proto in ('https://', 'http://', 'https:/', 'http:/'):
+        if tail.startswith(proto):
+            if tail.startswith('https:/') and not tail.startswith('https://'):
+                tail = 'https://' + tail[len('https:/'):]
+            elif tail.startswith('http:/') and not tail.startswith('http://'):
+                tail = 'http://' + tail[len('http:/'):]
+            return tail
     return url
 
 
