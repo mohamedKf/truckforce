@@ -1468,11 +1468,37 @@ class DriverLocationUpdateView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 
+# ── Location history retention ──────────────────────────────────────────
+# GPS pings power the live map and the trail replay, but grow forever.
+# Keep a rolling window instead of deleting everything weekly/monthly:
+# replay keeps working for the whole window, storage stays bounded.
+# Runs lazily (no cron, matching the rest of the codebase) at most once a
+# day, piggybacking on the manager opening the live map.
+LOCATION_RETENTION_DAYS = 60
+
+
+def _purge_old_locations():
+    from datetime import timedelta
+    from django.core.cache import cache
+    if cache.get('locations_purge_done'):
+        return
+    cache.set('locations_purge_done', 1, 60 * 60 * 24)  # once per day
+    try:
+        cutoff = timezone.now() - timedelta(days=LOCATION_RETENTION_DAYS)
+        deleted, _ = DriverLocation.objects.filter(timestamp__lt=cutoff).delete()
+        if deleted:
+            print(f'[LOCATIONS] purged {deleted} pings older than '
+                  f'{LOCATION_RETENTION_DAYS} days', flush=True)
+    except Exception as e:
+        print(f'[LOCATIONS] purge failed: {e}', flush=True)
+
+
 class ActiveDriversLocationsView(APIView):
     """Manager desktop fetches all currently-clocked-in drivers with latest location + trail."""
     permission_classes = [IsManager]
 
     def get(self, request):
+        _purge_old_locations()
         today = localdate()
 
         # Find all open shifts — no date filter (supports night shifts)
@@ -4237,3 +4263,34 @@ class ScheduleSummaryView(APIView):
             'manager_notes': schedule.manager_notes if hasattr(schedule, 'manager_notes') else '',
             'route_optimized': getattr(schedule, 'route_optimized', False),
         })
+
+
+class DriverLocationsHistoryView(APIView):
+    """Replay support for the office live map: returns the GPS trail each
+    driver actually drove on a given past date. One row per driver:
+        [{driver_id, trail: [{lat, lng}, ...]}, ...]
+    Optional ?driver=<id> narrows to one driver. Points come back in
+    chronological order so the client can draw them as a line directly.
+    """
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        from datetime import datetime as _dt
+        date_str  = request.query_params.get('date')
+        driver_id = request.query_params.get('driver')
+        try:
+            day = _dt.strptime(date_str, '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            return Response({'error': 'date=YYYY-MM-DD required'}, status=400)
+
+        qs = DriverLocation.objects.filter(timestamp__date=day)
+        if driver_id:
+            qs = qs.filter(driver_id=driver_id)
+        qs = qs.order_by('driver_id', 'timestamp')
+
+        grouped = {}
+        for l in qs:
+            grouped.setdefault(l.driver_id, []).append(
+                {'lat': float(l.latitude), 'lng': float(l.longitude)})
+        return Response(
+            [{'driver_id': k, 'trail': v} for k, v in grouped.items()])
