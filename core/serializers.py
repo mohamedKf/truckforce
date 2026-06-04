@@ -267,6 +267,15 @@ class StopSerializer(serializers.ModelSerializer):
     def get_delivery_note_url(self, obj):
         return _abs_url(obj.delivery_note_pdf, self.context.get('request'))
 
+    # Signed confirmation PDF (set once the driver collects a signature).
+    confirmation_pdf_url = serializers.SerializerMethodField()
+
+    def get_confirmation_pdf_url(self, obj):
+        conf = getattr(obj, 'confirmation', None)
+        if conf is None:
+            return None
+        return _abs_url(conf.pdf_file, self.context.get('request'))
+
     class Meta:
         model  = Stop
         fields = [
@@ -282,6 +291,7 @@ class StopSerializer(serializers.ModelSerializer):
             'pickup_stop',
             'driver_note',
             'delivery_note_url',
+            'confirmation_pdf_url',
         ]
         read_only_fields = ['completed_at', 'actual_arrival']
 

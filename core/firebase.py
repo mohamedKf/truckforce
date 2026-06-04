@@ -288,6 +288,17 @@ def notify_manager_stop_skipped(manager, driver, stop) -> bool:
     return _log_and_send_manager(manager, 'stop_skipped', title, body, data)
 
 
+def notify_manager_stop_done(manager, driver, stop) -> bool:
+    title = "✅ עצירה הושלמה"
+    body  = f"{driver.full_name} השלים: {stop.site_name}"
+    data  = {
+        "type":      "stop_done",
+        "stop_id":   stop.id,
+        "driver_id": driver.id,
+    }
+    return _log_and_send_manager(manager, 'stop_done', title, body, data)
+
+
 def notify_manager_day_summary(manager, driver, schedule) -> bool:
     missed = schedule.stops.filter(status='skipped').count()
     total  = schedule.stops.count()

@@ -48,6 +48,7 @@ from .auth_utils import (
 )
 from .firebase import (
     notify_manager_stop_skipped,
+    notify_manager_stop_done,
     notify_manager_day_summary,
     notify_driver_payslip_ready,
     notify_driver_schedule_assigned,
@@ -669,6 +670,9 @@ class ScheduleStopsAddView(APIView):
             'order', 'site_name', 'address',
             'latitude', 'longitude',
             'expected_arrival', 'notes',
+            # Preserved so a reassigned (cloned) stop keeps its full detail.
+            'stop_type', 'items', 'contact_name', 'contact_phone',
+            'allow_driver_reorder',
         }
         clean = {k: v for k, v in data.items() if k in EDITABLE}
         if not clean.get('site_name'):
@@ -677,6 +681,37 @@ class ScheduleStopsAddView(APIView):
         stop = Stop.objects.create(schedule=schedule, **clean)
         publish_event('schedules_changed', by_user_id=getattr(request.manager, 'id', None))
         return Response(StopSerializer(stop).data, status=201)
+
+
+def _notify_stop_completion(driver, stop, status):
+    """Notify all managers (FCM) and publish a desktop event when a driver
+    marks a stop done or skipped. This drives the manager's done/missed
+    toast notifications on the desktop, and FCM pushes for managers on mobile.
+    Failures here never break the stop update."""
+    managers = Manager.objects.filter(is_active=True)
+    for m in managers:
+        try:
+            if status == 'skipped':
+                notify_manager_stop_skipped(m, driver, stop)
+            elif status == 'done':
+                notify_manager_stop_done(m, driver, stop)
+        except Exception as e:
+            print(f"[STOP-NOTIFY] FCM to manager failed: {e}", flush=True)
+    try:
+        publish_event(
+            'stop_done' if status == 'done' else 'stop_skipped',
+            payload={
+                'stop_id':     stop.id,
+                'site_name':   getattr(stop, 'site_name', '') or '',
+                'driver_name': getattr(driver, 'full_name', '') or '',
+                'status':      status,
+                'order':       getattr(stop, 'order', None),
+                'skip_reason': getattr(stop, 'skip_reason', '') or '',
+            },
+            by_user_id=getattr(driver, 'id', None),
+        )
+    except Exception as e:
+        print(f"[STOP-NOTIFY] publish_event failed: {e}", flush=True)
 
 
 class StopUpdateView(APIView):
@@ -701,10 +736,6 @@ class StopUpdateView(APIView):
                 stop.actual_arrival = now
         elif new_status == 'skipped':
             stop.completed_at = now
-            # Notify all managers immediately
-            managers = Manager.objects.filter(is_active=True)
-            for manager in managers:
-                notify_manager_stop_skipped(manager, request.driver, stop)
         elif new_status == 'pending':
             # UNDO — only allowed within 30 minutes of the action
             if stop.completed_at:
@@ -719,6 +750,10 @@ class StopUpdateView(APIView):
             stop.skip_reason    = ''
 
         ser.save()
+
+        # Notify managers (toast on desktop + FCM) for done / skipped stops.
+        if new_status in ('done', 'skipped'):
+            _notify_stop_completion(request.driver, stop, new_status)
 
         # Check if all stops are resolved → update schedule status
         schedule = stop.schedule
@@ -2509,9 +2544,19 @@ def _send_confirmation_email(confirmation):
 
 class StopSignatureView(APIView):
     """
-    POST: Driver submits signature (as PNG) to create a delivery confirmation.
-    Generates PDF, sends via WhatsApp + email, stores everything.
-    GET:  Returns existing confirmation for this stop.
+    POST: Driver submits the signature PNG plus its position, and we stamp it
+          straight onto the stop's delivery-note PDF (the document the manager
+          attached). The signed PDF is saved to Cloudinary and the desktop
+          office app is notified via the realtime event. WhatsApp delivery to
+          the client now happens from the driver's own phone (free), so this
+          endpoint no longer calls any paid WhatsApp API — it just returns the
+          signed-PDF URL for the app to share.
+
+          If the stop has no delivery note attached (or stamping fails), we
+          fall back to the old behaviour: generate a standalone confirmation
+          PDF with ReportLab.
+
+    GET:  Returns the existing confirmation for this stop.
     """
     permission_classes = [IsManagerOrDriver]
     parser_classes     = [MultiPartParser, FormParser]
@@ -2526,11 +2571,12 @@ class StopSignatureView(APIView):
                 return Response({'error': 'Forbidden'}, status=403)
         if not hasattr(stop, 'confirmation'):
             return Response({'error': 'No confirmation yet'}, status=404)
-        return Response(DeliveryConfirmationSerializer(stop.confirmation).data)
+        return Response(DeliveryConfirmationSerializer(
+            stop.confirmation, context={'request': request}).data)
 
     def post(self, request, stop_id):
         try:
-            stop = Stop.objects.get(pk=stop_id)
+            stop = Stop.objects.select_related('schedule').get(pk=stop_id)
         except Stop.DoesNotExist:
             return Response({'error': 'Stop not found'}, status=404)
 
@@ -2541,7 +2587,8 @@ class StopSignatureView(APIView):
         if hasattr(stop, 'confirmation'):
             return Response({
                 'error': 'Already signed',
-                'confirmation': DeliveryConfirmationSerializer(stop.confirmation).data,
+                'confirmation': DeliveryConfirmationSerializer(
+                    stop.confirmation, context={'request': request}).data,
             }, status=400)
 
         signature_file  = request.FILES.get('signature')
@@ -2554,6 +2601,32 @@ class StopSignatureView(APIView):
         if not signed_by_name:
             return Response({'error': 'signed_by_name required'}, status=400)
 
+        # ── Signature placement on the note (normalized, top-left origin) ──
+        # The app sends fractions of the rendered page; defaults drop the
+        # signature into the lower-right area if a client sends nothing.
+        def _f(key, default):
+            try:
+                return float(request.data.get(key, default))
+            except (TypeError, ValueError):
+                return default
+        try:
+            sig_page = int(float(request.data.get('sig_page', 0)))
+        except (TypeError, ValueError):
+            sig_page = 0
+        sig_x = _f('sig_x', 0.55)
+        sig_y = _f('sig_y', 0.82)
+        sig_w = _f('sig_w', 0.35)
+        sig_h = _f('sig_h', 0.10)
+
+        # Read the signature bytes once for stamping; we still keep the raw
+        # PNG on the confirmation row for the record.
+        try:
+            signature_file.seek(0)
+            sig_bytes = signature_file.read()
+            signature_file.seek(0)
+        except Exception:
+            sig_bytes = b''
+
         conf = DeliveryConfirmation.objects.create(
             stop=stop,
             signed_by_name=signed_by_name,
@@ -2562,37 +2635,70 @@ class StopSignatureView(APIView):
             signature_image=signature_file,
         )
 
-        # Generate PDF
-        try:
-            from .delivery_pdf import generate_delivery_pdf
-            from django.core.files.base import ContentFile
-            pdf_bytes = generate_delivery_pdf(conf)
-            conf.pdf_file.save(
-                f'confirmation_{stop.id}.pdf',
-                ContentFile(pdf_bytes),
-                save=True,
-            )
-        except Exception as e:
-            print(f'[PDF] generation error: {e}', flush=True)
+        # ── Build the signed PDF ───────────────────────────────────────────
+        pdf_bytes = None
 
-        # Send notifications in background
+        # Preferred path: stamp onto the manager's actual delivery note.
+        note_url = ''
+        try:
+            if stop.delivery_note_pdf:
+                note_url = stop.delivery_note_pdf.url
+        except Exception:
+            note_url = ''
+
+        if note_url and sig_bytes:
+            try:
+                import requests as _rq
+                from .delivery_stamp import stamp_signature_on_note
+                note_resp = _rq.get(note_url, timeout=30)
+                if note_resp.status_code == 200 and note_resp.content:
+                    pdf_bytes = stamp_signature_on_note(
+                        note_resp.content, sig_bytes,
+                        page=sig_page, nx=sig_x, ny=sig_y, nw=sig_w, nh=sig_h,
+                    )
+            except Exception as e:
+                print(f'[STAMP] error: {e}', flush=True)
+
+        # Fallback: no note attached (or stamping failed) → standalone PDF.
+        if not pdf_bytes:
+            try:
+                from .delivery_pdf import generate_delivery_pdf
+                pdf_bytes = generate_delivery_pdf(conf)
+            except Exception as e:
+                print(f'[PDF] generation error: {e}', flush=True)
+
+        # ── Store the signed PDF (Cloudinary via the FileField storage) ────
+        # _abs_url on the serializer keeps the read-side URL clean, so the
+        # plain storage save is safe here and matches the prior flow.
+        if pdf_bytes:
+            try:
+                from django.core.files.base import ContentFile
+                conf.pdf_file.save(
+                    f'confirmation_{stop.id}.pdf',
+                    ContentFile(pdf_bytes),
+                    save=True,
+                )
+            except Exception as e:
+                print(f'[CONFIRMATION] PDF save failed: {e}', flush=True)
+
+        # ── Email only (free SMTP) in the background. No paid WhatsApp API:
+        #    the WhatsApp confirmation is sent from the driver's phone. ──────
         import threading
         _conf_pk = conf.pk
         def _send():
             from core.models import DeliveryConfirmation as DC
             c = DC.objects.get(pk=_conf_pk)
-            wa_ok    = _send_confirmation_whatsapp(c)
             email_ok = _send_confirmation_email(c)
-            DC.objects.filter(pk=_conf_pk).update(
-                whatsapp_sent=wa_ok,
-                email_sent=email_ok,
-            )
-            print(f'[CONFIRMATION] WA={wa_ok} Email={email_ok}', flush=True)
+            DC.objects.filter(pk=_conf_pk).update(email_sent=email_ok)
+            print(f'[CONFIRMATION] Email={email_ok}', flush=True)
         threading.Thread(target=_send, daemon=True).start()
 
         publish_event('schedules_changed',
                       by_user_id=getattr(getattr(request, 'driver', None), 'id', None))
-        return Response(DeliveryConfirmationSerializer(conf).data, status=201)
+        return Response(
+            DeliveryConfirmationSerializer(conf, context={'request': request}).data,
+            status=201,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -4027,6 +4133,10 @@ class StopCompleteView(APIView):
             'driver_id': stop.schedule.driver.id,
             'order': stop.order,
         })
+
+        # Manager toast (desktop) + FCM for done & skipped stops.
+        if action in ('done', 'skipped') and stop.schedule.driver:
+            _notify_stop_completion(stop.schedule.driver, stop, action)
 
         return Response({
             'ok': True,
