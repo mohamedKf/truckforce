@@ -2697,15 +2697,43 @@ class StopSignatureView(APIView):
         # _abs_url on the serializer keeps the read-side URL clean, so the
         # plain storage save is safe here and matches the prior flow.
         if pdf_bytes:
+            # Upload straight through the Cloudinary SDK as resource_type
+            # 'raw' — the same proven path as the delivery-note upload. The
+            # Django storage layer uploads PDFs as *image* assets, which
+            # Cloudinary refuses to deliver (and it mangles the public_id
+            # into a nested URL — the old doubled-URL bug all over again).
+            import os as _os
+            import tempfile as _tempfile
             try:
-                from django.core.files.base import ContentFile
-                conf.pdf_file.save(
-                    f'confirmation_{stop.id}.pdf',
-                    ContentFile(pdf_bytes),
-                    save=True,
-                )
+                import cloudinary.uploader
+                tmp = _tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                try:
+                    tmp.write(pdf_bytes)
+                    tmp.close()
+                    result = cloudinary.uploader.upload(
+                        tmp.name,
+                        resource_type='raw',
+                        folder='confirmation_pdfs',
+                        public_id=f'confirmation_{stop.id}_{conf.pk}.pdf',
+                        use_filename=False,
+                        unique_filename=False,
+                        overwrite=True,
+                    )
+                finally:
+                    try:
+                        _os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                secure_url = result.get('secure_url') or result.get('url')
+                if secure_url:
+                    # Store the absolute URL directly; _abs_url passes full
+                    # URLs through untouched on the read side.
+                    conf.pdf_file = secure_url
+                    conf.save(update_fields=['pdf_file'])
+                else:
+                    print('[CONFIRMATION] upload returned no URL', flush=True)
             except Exception as e:
-                print(f'[CONFIRMATION] PDF save failed: {e}', flush=True)
+                print(f'[CONFIRMATION] PDF upload failed: {e}', flush=True)
 
         # ── Email only (free SMTP) in the background. No paid WhatsApp API:
         #    the WhatsApp confirmation is sent from the driver's phone. ──────
