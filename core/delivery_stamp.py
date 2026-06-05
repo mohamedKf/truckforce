@@ -79,3 +79,30 @@ def stamp_signature_on_note(
             doc.close()
         except Exception:
             pass
+
+
+def append_pdf(base_bytes: bytes, extra_bytes: bytes) -> bytes:
+    """Merge two PDFs: returns base + extra appended as additional page(s).
+    Used to attach the generated confirmation page after the signed
+    delivery note, so the client receives ONE document with everything.
+    On any failure, returns the base unchanged — merging must never cost
+    us the signed note."""
+    base = None
+    extra = None
+    try:
+        import fitz  # PyMuPDF
+        base = fitz.open(stream=base_bytes, filetype='pdf')
+        extra = fitz.open(stream=extra_bytes, filetype='pdf')
+        base.insert_pdf(extra)
+        out = io.BytesIO()
+        base.save(out, deflate=True)
+        return out.getvalue()
+    except Exception:
+        return base_bytes
+    finally:
+        for _d in (base, extra):
+            try:
+                if _d is not None:
+                    _d.close()
+            except Exception:
+                pass

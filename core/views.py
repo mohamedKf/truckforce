@@ -2682,10 +2682,15 @@ class StopSignatureView(APIView):
             signature_image=signature_file,
         )
 
-        # ── Build the signed PDF ───────────────────────────────────────────
-        pdf_bytes = None
+        # ── Build the documents ────────────────────────────────────────────
+        # Every signed stop gets TWO PDFs:
+        #   1. stamped — the manager's ORIGINAL delivery note with the
+        #      client's signature stamped on it (when a note is attached)
+        #   2. summary — the generated confirmation page (date, time,
+        #      address, signature) — ALWAYS created
+        stamped_bytes = None
+        summary_bytes = None
 
-        # Preferred path: stamp onto the manager's actual delivery note.
         # CRITICAL: read .name BEFORE touching .url — the note field stores a
         # complete Cloudinary URL as its name (direct SDK upload), and calling
         # .url on it makes the storage layer nest it into a broken URL.
@@ -2707,7 +2712,7 @@ class StopSignatureView(APIView):
                 from .delivery_stamp import stamp_signature_on_note
                 note_resp = _rq.get(note_url, timeout=30)
                 if note_resp.status_code == 200 and note_resp.content:
-                    pdf_bytes = stamp_signature_on_note(
+                    stamped_bytes = stamp_signature_on_note(
                         note_resp.content, sig_bytes,
                         page=sig_page, nx=sig_x, ny=sig_y, nw=sig_w, nh=sig_h,
                     )
@@ -2719,38 +2724,43 @@ class StopSignatureView(APIView):
                 print(f'[STAMP] error: {e}', flush=True)
         elif not note_url:
             print(f'[STAMP] stop {stop.id} has no delivery note — '
-                  f'using fallback confirmation', flush=True)
+                  f'confirmation page only', flush=True)
 
-        # Fallback: no note attached (or stamping failed) → standalone PDF.
-        if not pdf_bytes:
-            try:
-                from .delivery_pdf import generate_delivery_pdf
-                pdf_bytes = generate_delivery_pdf(conf)
-            except Exception as e:
-                print(f'[PDF] generation error: {e}', flush=True)
+        # The confirmation page is always generated.
+        try:
+            from .delivery_pdf import generate_delivery_pdf
+            summary_bytes = generate_delivery_pdf(conf)
+        except Exception as e:
+            print(f'[PDF] summary generation error: {e}', flush=True)
 
-        # ── Store the signed PDF (Cloudinary via the FileField storage) ────
-        # _abs_url on the serializer keeps the read-side URL clean, so the
-        # plain storage save is safe here and matches the prior flow.
-        if pdf_bytes:
-            # Upload straight through the Cloudinary SDK as resource_type
-            # 'raw' — the same proven path as the delivery-note upload. The
-            # Django storage layer uploads PDFs as *image* assets, which
-            # Cloudinary refuses to deliver (and it mangles the public_id
-            # into a nested URL — the old doubled-URL bug all over again).
+        # One final document: signed note + confirmation page appended.
+        # No note → the confirmation page alone (old fallback behaviour).
+        if stamped_bytes and summary_bytes:
+            from .delivery_stamp import append_pdf
+            final_bytes = append_pdf(stamped_bytes, summary_bytes)
+        else:
+            final_bytes = stamped_bytes or summary_bytes
+
+        # ── Upload to Cloudinary ────────────────────────────────────────────
+        def _upload_pdf(data, public_id):
+            """Direct raw SDK upload — the same proven path as the
+            delivery-note upload. The Django storage layer uploads PDFs as
+            *image* assets, which Cloudinary refuses to deliver (and it
+            mangles the public_id into a nested URL — the old doubled-URL
+            bug all over again)."""
             import os as _os
             import tempfile as _tempfile
             try:
                 import cloudinary.uploader
                 tmp = _tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
                 try:
-                    tmp.write(pdf_bytes)
+                    tmp.write(data)
                     tmp.close()
                     result = cloudinary.uploader.upload(
                         tmp.name,
                         resource_type='raw',
                         folder='confirmation_pdfs',
-                        public_id=f'confirmation_{stop.id}_{conf.pk}.pdf',
+                        public_id=public_id,
                         use_filename=False,
                         unique_filename=False,
                         overwrite=True,
@@ -2760,16 +2770,24 @@ class StopSignatureView(APIView):
                         _os.unlink(tmp.name)
                     except OSError:
                         pass
-                secure_url = result.get('secure_url') or result.get('url')
-                if secure_url:
-                    # Store the absolute URL directly; _abs_url passes full
-                    # URLs through untouched on the read side.
-                    conf.pdf_file = secure_url
-                    conf.save(update_fields=['pdf_file'])
-                else:
-                    print('[CONFIRMATION] upload returned no URL', flush=True)
+                url = result.get('secure_url') or result.get('url')
+                if not url:
+                    print(f'[CONFIRMATION] upload returned no URL '
+                          f'({public_id})', flush=True)
+                return url
             except Exception as e:
-                print(f'[CONFIRMATION] PDF upload failed: {e}', flush=True)
+                print(f'[CONFIRMATION] PDF upload failed ({public_id}): {e}',
+                      flush=True)
+                return None
+
+        # Upload the single merged document. Store the absolute URL
+        # directly; _abs_url passes it through untouched on the read side.
+        if final_bytes:
+            url = _upload_pdf(final_bytes,
+                              f'confirmation_{stop.id}_{conf.pk}.pdf')
+            if url:
+                conf.pdf_file = url
+                conf.save(update_fields=['pdf_file'])
 
         # ── Email only (free SMTP) in the background. No paid WhatsApp API:
         #    the WhatsApp confirmation is sent from the driver's phone. ──────
