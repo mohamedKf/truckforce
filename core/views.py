@@ -1478,19 +1478,40 @@ LOCATION_RETENTION_DAYS = 60
 
 
 def _purge_old_locations():
-    from datetime import timedelta
+    """Daily location cleanup. Runs in a background thread and deletes in
+    small chunks with breathing room between them — a single giant DELETE
+    can lock the locations table long enough to stall every worker (which
+    froze the whole API once; never again)."""
     from django.core.cache import cache
     if cache.get('locations_purge_done'):
         return
     cache.set('locations_purge_done', 1, 60 * 60 * 24)  # once per day
-    try:
-        cutoff = timezone.now() - timedelta(days=LOCATION_RETENTION_DAYS)
-        deleted, _ = DriverLocation.objects.filter(timestamp__lt=cutoff).delete()
-        if deleted:
-            print(f'[LOCATIONS] purged {deleted} pings older than '
-                  f'{LOCATION_RETENTION_DAYS} days', flush=True)
-    except Exception as e:
-        print(f'[LOCATIONS] purge failed: {e}', flush=True)
+
+    def _run():
+        import time
+        from datetime import timedelta
+        try:
+            cutoff = timezone.now() - timedelta(days=LOCATION_RETENTION_DAYS)
+            total = 0
+            while True:
+                ids = list(
+                    DriverLocation.objects
+                    .filter(timestamp__lt=cutoff)
+                    .values_list('id', flat=True)[:5000]
+                )
+                if not ids:
+                    break
+                deleted, _ = DriverLocation.objects.filter(id__in=ids).delete()
+                total += deleted
+                time.sleep(0.2)  # let other queries through between chunks
+            if total:
+                print(f'[LOCATIONS] purged {total} pings older than '
+                      f'{LOCATION_RETENTION_DAYS} days', flush=True)
+        except Exception as e:
+            print(f'[LOCATIONS] purge failed: {e}', flush=True)
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
 
 
 class ActiveDriversLocationsView(APIView):
@@ -2665,10 +2686,18 @@ class StopSignatureView(APIView):
         pdf_bytes = None
 
         # Preferred path: stamp onto the manager's actual delivery note.
+        # CRITICAL: read .name BEFORE touching .url — the note field stores a
+        # complete Cloudinary URL as its name (direct SDK upload), and calling
+        # .url on it makes the storage layer nest it into a broken URL.
         note_url = ''
         try:
-            if stop.delivery_note_pdf:
-                note_url = stop.delivery_note_pdf.url
+            note_field = stop.delivery_note_pdf
+            if note_field:
+                _name = str(getattr(note_field, 'name', '') or '')
+                if _name.startswith('http'):
+                    note_url = _name
+                else:
+                    note_url = note_field.url
         except Exception:
             note_url = ''
 
@@ -2682,8 +2711,15 @@ class StopSignatureView(APIView):
                         note_resp.content, sig_bytes,
                         page=sig_page, nx=sig_x, ny=sig_y, nw=sig_w, nh=sig_h,
                     )
+                else:
+                    print(f'[STAMP] note download failed: '
+                          f'HTTP {note_resp.status_code} {note_url[:140]}',
+                          flush=True)
             except Exception as e:
                 print(f'[STAMP] error: {e}', flush=True)
+        elif not note_url:
+            print(f'[STAMP] stop {stop.id} has no delivery note — '
+                  f'using fallback confirmation', flush=True)
 
         # Fallback: no note attached (or stamping failed) → standalone PDF.
         if not pdf_bytes:
