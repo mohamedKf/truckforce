@@ -4,9 +4,19 @@ delivery_pdf.py  —  Generate a delivery confirmation PDF using ReportLab.
 Usage:
     from core.delivery_pdf import generate_delivery_pdf
     pdf_bytes = generate_delivery_pdf(confirmation)
+
+Hebrew/Arabic support:
+    Put DejaVuSans.ttf (and optionally DejaVuSans-Bold.ttf) inside
+    core/fonts/ — the repo-bundled font is found first, so the PDF
+    renders Hebrew on any server. RTL text is reordered with
+    python-bidi (and Arabic letters joined with arabic-reshaper)
+    when those packages are installed; without them the text still
+    renders, just unshaped.
 """
 
 import io
+import os
+import re
 from datetime import datetime
 
 from reportlab.lib import colors
@@ -20,24 +30,124 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.fonts import addMapping
 
-# ── Attempt to register Hebrew font ──────────────────────────────────────────
-import os, django
+# ── Register a Hebrew-capable font ────────────────────────────────────────────
+# The repo-bundled font comes FIRST so this works on Railway (the container
+# ships no system fonts). System paths remain as fallbacks for local dev.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_PATHS = [
+    os.path.join(_HERE, 'fonts', 'DejaVuSans.ttf'),
     '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
     '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
     'C:/Windows/Fonts/Arial.ttf',
     'C:/Windows/Fonts/arial.ttf',
 ]
+_BOLD_PATHS = [
+    os.path.join(_HERE, 'fonts', 'DejaVuSans-Bold.ttf'),
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    'C:/Windows/Fonts/arialbd.ttf',
+]
+
 BODY_FONT = 'Helvetica'
 for _fp in _FONT_PATHS:
     if os.path.exists(_fp):
         try:
             pdfmetrics.registerFont(TTFont('DejaVu', _fp))
             BODY_FONT = 'DejaVu'
+            break
+        except Exception:
+            continue
+
+if BODY_FONT == 'DejaVu':
+    _bold_name = 'DejaVu'
+    for _bp in _BOLD_PATHS:
+        if os.path.exists(_bp):
+            try:
+                pdfmetrics.registerFont(TTFont('DejaVu-Bold', _bp))
+                _bold_name = 'DejaVu-Bold'
+                break
+            except Exception:
+                continue
+    # Map <b>/<i> markup onto the registered faces so Paragraph markup
+    # keeps working with the TTF (without this, <b> tags can crash).
+    addMapping('DejaVu', 0, 0, 'DejaVu')
+    addMapping('DejaVu', 1, 0, _bold_name)
+    addMapping('DejaVu', 0, 1, 'DejaVu')
+    addMapping('DejaVu', 1, 1, _bold_name)
+
+# ── RTL (Hebrew/Arabic) shaping ───────────────────────────────────────────────
+# ReportLab lays glyphs left-to-right; bidi reordering makes Hebrew/Arabic
+# read correctly. Both packages are optional — missing ones degrade
+# gracefully instead of crashing PDF generation.
+_RTL_RE    = re.compile(r'[\u0590-\u08FF]')
+_ARABIC_RE = re.compile(r'[\u0600-\u06FF]')
+
+try:
+    from bidi.algorithm import get_display as _bidi_display
+except Exception:                                     # pragma: no cover
+    _bidi_display = None
+
+try:
+    import arabic_reshaper as _arabic_reshaper
+except Exception:                                     # pragma: no cover
+    _arabic_reshaper = None
+
+
+def _rtl(text):
+    """Return text reordered for correct RTL display inside the PDF."""
+    s = str(text if text is not None else '')
+    if not _RTL_RE.search(s):
+        return s
+    if _arabic_reshaper and _ARABIC_RE.search(s):
+        try:
+            s = _arabic_reshaper.reshape(s)
         except Exception:
             pass
-        break
+    if _bidi_display:
+        try:
+            return _bidi_display(s)
+        except Exception:
+            return s
+    return s
+
+
+# ── Cloudinary-safe image source ──────────────────────────────────────────────
+def _img_source(filefield):
+    """Return something RLImage can draw from a FileField that may live on
+    Cloudinary. Remote storages have no usable .path, so we download the
+    bytes from the URL instead. Returns a path, a BytesIO, or None."""
+    if not filefield:
+        return None
+
+    # The field may store a complete URL string (direct SDK uploads).
+    name = str(getattr(filefield, 'name', '') or '')
+    url = name if name.startswith('http') else None
+
+    if url is None:
+        # Local storage first (dev machines).
+        try:
+            p = filefield.path
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+        try:
+            url = filefield.url
+        except Exception:
+            return None
+
+    if not url or not str(url).startswith('http'):
+        return None
+    try:
+        import requests
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200 and resp.content:
+            return io.BytesIO(resp.content)
+    except Exception:
+        pass
+    return None
+
 
 # Colours
 PRIMARY   = colors.HexColor('#F5A623')   # amber
@@ -95,7 +205,8 @@ def generate_delivery_pdf(confirmation) -> bytes:
 
     # ── Header ──────────────────────────────────────────────────────────────
     header_data = [[
-        Paragraph(f"<b>{company_name}</b>", _style('co', fontSize=18, textColor=DARK)),
+        Paragraph(f"<b>{_rtl(company_name)}</b>",
+                  _style('co', fontSize=18, textColor=DARK)),
         Paragraph(
             f"{company_phone}<br/>{company_email}",
             _style('co_info', fontSize=9, textColor=MUTED, alignment=TA_RIGHT),
@@ -111,7 +222,7 @@ def generate_delivery_pdf(confirmation) -> bytes:
 
     # ── Title ────────────────────────────────────────────────────────────────
     story.append(Paragraph(
-        'DELIVERY CONFIRMATION  /  אישור מסירה',
+        _rtl('DELIVERY CONFIRMATION  /  אישור מסירה'),
         _style('title', fontSize=16, fontName=BODY_FONT,
                textColor=DARK, alignment=TA_CENTER, spaceAfter=2),
     ))
@@ -126,8 +237,8 @@ def generate_delivery_pdf(confirmation) -> bytes:
     # ── Info grid ────────────────────────────────────────────────────────────
     def info_row(label, value):
         return [
-            Paragraph(f"<b>{label}</b>", _style('lbl', fontSize=9, textColor=MUTED)),
-            Paragraph(str(value or '—'), _style('val', fontSize=10)),
+            Paragraph(f"<b>{_rtl(label)}</b>", _style('lbl', fontSize=9, textColor=MUTED)),
+            Paragraph(_rtl(value) if value else '—', _style('val', fontSize=10)),
         ]
 
     info_data = [
@@ -160,13 +271,16 @@ def generate_delivery_pdf(confirmation) -> bytes:
     # ── Delivery photos ──────────────────────────────────────────────────────
     photos = list(stop.photos.all()[:6])  # max 6 thumbnails
     if photos:
-        story.append(Paragraph('<b>Delivery Photos / תמונות מסירה</b>',
+        story.append(Paragraph(f"<b>{_rtl('Delivery Photos / תמונות מסירה')}</b>",
                                _style('sec', fontSize=11, textColor=DARK, spaceAfter=6)))
         photo_cells = []
         row = []
         for i, photo in enumerate(photos):
             try:
-                img = RLImage(photo.image.path, width=4.5*cm, height=3.5*cm)
+                src = _img_source(photo.image)
+                if src is None:
+                    raise ValueError('no image source')
+                img = RLImage(src, width=4.5*cm, height=3.5*cm)
                 img.hAlign = 'CENTER'
                 row.append(img)
             except Exception:
@@ -191,15 +305,19 @@ def generate_delivery_pdf(confirmation) -> bytes:
 
     # ── Signature section ────────────────────────────────────────────────────
     story.append(HRFlowable(width='100%', thickness=1, color=BORDER, spaceAfter=10))
-    story.append(Paragraph('<b>Recipient Signature / חתימת מקבל</b>',
+    story.append(Paragraph(f"<b>{_rtl('Recipient Signature / חתימת מקבל')}</b>",
                            _style('sec', fontSize=11, textColor=DARK, spaceAfter=8)))
 
     sig_left  = []
     sig_right = []
 
-    # Signature image
+    # Signature image — drawn from URL bytes (Cloudinary) or local path;
+    # mask='auto' keeps the transparent-background PNG clean on white.
     try:
-        sig_img = RLImage(confirmation.signature_image.path, width=7*cm, height=3*cm)
+        src = _img_source(confirmation.signature_image)
+        if src is None:
+            raise ValueError('no signature source')
+        sig_img = RLImage(src, width=7*cm, height=3*cm, mask='auto')
         sig_img.hAlign = 'LEFT'
         sig_left.append(sig_img)
     except Exception:
@@ -208,18 +326,18 @@ def generate_delivery_pdf(confirmation) -> bytes:
     sig_left.append(Spacer(1, 4))
     sig_left.append(HRFlowable(width='100%', thickness=0.5, color=BORDER))
     sig_left.append(Paragraph(
-        f"<b>{confirmation.signed_by_name}</b>",
+        f"<b>{_rtl(confirmation.signed_by_name)}</b>",
         _style('signer', fontSize=11, textColor=DARK),
     ))
     sig_left.append(Paragraph(
-        f"<font color='#888888'>Received by / התקבל על ידי</font>",
+        f"<font color='#888888'>{_rtl('Received by / התקבל על ידי')}</font>",
         _style('rcv', fontSize=9, textColor=MUTED),
     ))
 
     # Stamp area on right
     sig_right.append(Spacer(1, 0.5*cm))
     stamp_inner = Table(
-        [[Paragraph('<font color="#CCCCCC">חותמת / Stamp</font>',
+        [[Paragraph(f"<font color='#CCCCCC'>{_rtl('חותמת / Stamp')}</font>",
                     _style('stamp', fontSize=9, alignment=TA_CENTER))]],
         colWidths=[6*cm], rowHeights=[3.5*cm],
     )
@@ -230,7 +348,6 @@ def generate_delivery_pdf(confirmation) -> bytes:
     ]))
     sig_right.append(stamp_inner)
 
-    from reportlab.platypus import KeepInFrame
     sig_tbl = Table(
         [[sig_left, sig_right]],
         colWidths=['55%', '45%'],
@@ -246,7 +363,7 @@ def generate_delivery_pdf(confirmation) -> bytes:
     # ── Footer ───────────────────────────────────────────────────────────────
     story.append(HRFlowable(width='100%', thickness=1, color=BORDER, spaceBefore=4))
     story.append(Paragraph(
-        f'<font color="#AAAAAA" size="8">Generated by TruckForce  •  {company_name}  •  {signed_dt}</font>',
+        f'<font color="#AAAAAA" size="8">Generated by TruckForce  •  {_rtl(company_name)}  •  {signed_dt}</font>',
         _style('footer', fontSize=8, textColor=MUTED, alignment=TA_CENTER, spaceBefore=4),
     ))
 
