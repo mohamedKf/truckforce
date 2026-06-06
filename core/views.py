@@ -4673,9 +4673,6 @@ class FinanceDocumentListCreateView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         qs = FinanceDocument.objects.all()
         if request.query_params.get('year'):
             qs = qs.filter(doc_date__year=request.query_params['year'])
@@ -4688,9 +4685,6 @@ class FinanceDocumentListCreateView(APIView):
                                       context={'request': request}).data)
 
     def post(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         f = request.FILES.get('file')
         if f is None:
             return Response({'error': 'file is required'}, status=400)
@@ -4739,9 +4733,6 @@ class FinanceDocumentDeleteView(APIView):
     permission_classes = [IsManager]
 
     def delete(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         doc = get_object_or_404(FinanceDocument, pk=pk)
         doc.delete()
         return Response(status=204)
@@ -4763,9 +4754,10 @@ def _get_or_create_scan_token():
 
 
 def _scan_token_valid(token: str) -> bool:
+    # The scanner/archive is part of the BASE package — only invoice
+    # ISSUING (clients, invoices, Green Invoice) sits behind the paid flag.
     co = CompanySettings.objects.first()
-    return bool(co and co.invoicing_enabled and co.scan_token
-                and token == co.scan_token)
+    return bool(co and co.scan_token and token == co.scan_token)
 
 
 def scan_page_view(request, token):
@@ -4847,13 +4839,13 @@ class ScanQRView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         token = _get_or_create_scan_token()
         if not token:
             return Response({'error': 'no company settings'}, status=400)
-        scan_url = request.build_absolute_uri(f'/api/scan/{token}/')
+        # Derive the mount prefix from this view's own path so the scan
+        # URL is correct no matter where the API is mounted.
+        prefix = request.path[:-len('billing/scan-qr/')]
+        scan_url = request.build_absolute_uri(f'{prefix}scan/{token}/')
 
         qr_b64 = None
         try:
@@ -4870,9 +4862,6 @@ class ScanQRView(APIView):
         return Response({'url': scan_url, 'qr_png_base64': qr_b64})
 
     def post(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         import secrets
         co = CompanySettings.objects.first()
         co.scan_token = secrets.token_urlsafe(24)
@@ -4887,9 +4876,6 @@ class FinanceExportPDFView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         year = request.query_params.get('year')
         month = request.query_params.get('month')
         if not year or not month:
