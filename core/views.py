@@ -2729,7 +2729,10 @@ class StopSignatureView(APIView):
         # The confirmation page is always generated.
         try:
             from .delivery_pdf import generate_delivery_pdf
-            summary_bytes = generate_delivery_pdf(conf)
+            # Pass the signature bytes we already hold — saves the PDF
+            # generator a round-trip download of the asset we just uploaded
+            # (which can stall on CDN propagation right after upload).
+            summary_bytes = generate_delivery_pdf(conf, signature_bytes=sig_bytes)
         except Exception as e:
             print(f'[PDF] summary generation error: {e}', flush=True)
 

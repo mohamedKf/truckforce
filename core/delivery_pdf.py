@@ -170,7 +170,7 @@ def _style(name, **kwargs):
     return ParagraphStyle(name, **base)
 
 
-def generate_delivery_pdf(confirmation) -> bytes:
+def generate_delivery_pdf(confirmation, signature_bytes=None) -> bytes:
     """
     confirmation — a DeliveryConfirmation model instance with
     .stop, .signed_by_name, .signed_by_phone, .signed_by_email,
@@ -314,7 +314,10 @@ def generate_delivery_pdf(confirmation) -> bytes:
     # Signature image — drawn from URL bytes (Cloudinary) or local path;
     # mask='auto' keeps the transparent-background PNG clean on white.
     try:
-        src = _img_source(confirmation.signature_image)
+        if signature_bytes:
+            src = io.BytesIO(signature_bytes)
+        else:
+            src = _img_source(confirmation.signature_image)
         if src is None:
             raise ValueError('no signature source')
         sig_img = RLImage(src, width=7*cm, height=3*cm, mask='auto')
