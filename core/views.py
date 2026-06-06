@@ -4533,6 +4533,9 @@ class InvoiceListCreateView(APIView):
                               context={'request': request}).data)
 
     def post(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
         client = get_object_or_404(Client, pk=request.data.get('client'))
         inv = Invoice.objects.create(
             client=client,
@@ -4604,6 +4607,9 @@ class InvoiceIssueView(APIView):
     permission_classes = [IsManager]
 
     def post(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
         inv = get_object_or_404(Invoice, pk=pk)
         if inv.status != 'draft':
             return Response({'error': 'Already issued'}, status=400)
@@ -4638,6 +4644,27 @@ class InvoiceIssueView(APIView):
 
         inv.status = 'issued'
         inv.save()
+
+        # File the issued document into the month archive as income, so
+        # the archive shows the complete financial picture of the month
+        # (same PDF, same amount — one source of truth).
+        try:
+            pdf_name = str(getattr(inv.pdf_file, 'name', '') or '')
+            if pdf_name:
+                FinanceDocument.objects.create(
+                    kind='income',
+                    doc_date=inv.issue_date,
+                    client=inv.client,
+                    vendor_name=inv.client_name,
+                    vendor_tax_id=inv.client_tax_id,
+                    amount=inv.total,
+                    file=pdf_name,
+                    original_filename=f'חשבון_עסקה_{inv.number}.pdf',
+                    notes=f'חשבון עסקה {inv.number}',
+                )
+        except Exception as e:
+            print(f'[INVOICE] archive filing failed: {e}', flush=True)
+
         return Response(
             InvoiceSerializer(inv, context={'request': request}).data)
 
