@@ -4533,9 +4533,6 @@ class InvoiceListCreateView(APIView):
                               context={'request': request}).data)
 
     def post(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         client = get_object_or_404(Client, pk=request.data.get('client'))
         inv = Invoice.objects.create(
             client=client,
@@ -4607,9 +4604,6 @@ class InvoiceIssueView(APIView):
     permission_classes = [IsManager]
 
     def post(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         inv = get_object_or_404(Invoice, pk=pk)
         if inv.status != 'draft':
             return Response({'error': 'Already issued'}, status=400)
