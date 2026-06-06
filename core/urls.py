@@ -126,4 +126,13 @@ urlpatterns = [
     path('version/',                      views.app_version),
     path('downloads/<str:filename>',      views.download_release),
     path('upload-release/',               views.UploadReleaseView.as_view()),
+
+    # ── Invoicing module (paid add-on; gated server-side) ─────────────
+    path('billing/clients/',                 views.ClientListCreateView.as_view()),
+    path('billing/clients/<int:pk>/',        views.ClientDetailView.as_view()),
+    path('billing/invoices/',                views.InvoiceListCreateView.as_view()),
+    path('billing/invoices/<int:pk>/issue/', views.InvoiceIssueView.as_view()),
+    path('billing/invoices/<int:pk>/',       views.InvoiceDetailView.as_view()),
+    path('billing/finance-docs/',            views.FinanceDocumentListCreateView.as_view()),
+    path('billing/finance-docs/<int:pk>/',   views.FinanceDocumentDeleteView.as_view()),
 ]

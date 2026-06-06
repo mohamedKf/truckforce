@@ -607,3 +607,60 @@ class DeliveryConfirmationSerializer(serializers.ModelSerializer):
 
     def get_pdf_url(self, obj):
         return _abs_url(obj.pdf_file, self.context.get('request'))
+
+
+# ──────────────────────────────────────────────
+# INVOICING MODULE
+# ──────────────────────────────────────────────
+from .models import Client, Invoice, InvoiceLine, FinanceDocument
+
+
+class ClientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Client
+        fields = '__all__'
+
+
+class InvoiceLineSerializer(serializers.ModelSerializer):
+    line_total = serializers.SerializerMethodField()
+    stop_site  = serializers.SerializerMethodField()
+
+    class Meta:
+        model = InvoiceLine
+        fields = ['id', 'stop', 'stop_site', 'description',
+                  'quantity', 'unit_price', 'line_total', 'order']
+
+    def get_line_total(self, obj):
+        return str(obj.line_total)
+
+    def get_stop_site(self, obj):
+        return obj.stop.site_name if obj.stop_id else None
+
+
+class InvoiceSerializer(serializers.ModelSerializer):
+    lines          = InvoiceLineSerializer(many=True, read_only=True)
+    client_display = serializers.SerializerMethodField()
+    pdf_url        = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Invoice
+        fields = '__all__'
+
+    def get_client_display(self, obj):
+        return obj.client_name or (obj.client.name if obj.client_id else '')
+
+    def get_pdf_url(self, obj):
+        return _abs_url(obj.pdf_file, self.context.get('request'))
+
+
+class FinanceDocumentSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+    year     = serializers.ReadOnlyField()
+    month    = serializers.ReadOnlyField()
+
+    class Meta:
+        model = FinanceDocument
+        fields = '__all__'
+
+    def get_file_url(self, obj):
+        return _abs_url(obj.file, self.context.get('request'))

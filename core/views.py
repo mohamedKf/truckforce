@@ -4379,3 +4379,369 @@ class DriverLocationsHistoryView(APIView):
                 {'lat': float(l.latitude), 'lng': float(l.longitude)})
         return Response(
             [{'driver_id': k, 'trail': v} for k, v in grouped.items()])
+
+
+# ──────────────────────────────────────────────
+# INVOICING MODULE (paid add-on — gated by CompanySettings.invoicing_enabled)
+# ──────────────────────────────────────────────
+from decimal import Decimal, InvalidOperation
+from django.db.models import Max
+from django.utils.dateparse import parse_date
+from .models import Client, Invoice, InvoiceLine, FinanceDocument
+from .serializers import (ClientSerializer, InvoiceSerializer,
+                          FinanceDocumentSerializer)
+
+
+def _invoicing_guard():
+    """Returns a 403 Response when the billing module is off, else None.
+    One flag in CompanySettings — flipped when the client pays for the
+    add-on; no redeploy needed."""
+    co = CompanySettings.objects.first()
+    if co is None or not co.invoicing_enabled:
+        return Response(
+            {'error': 'Invoicing module is not enabled for this account'},
+            status=403)
+    return None
+
+
+def _dec(value, default='0'):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(default)
+
+
+def _apply_lines(invoice, lines_data):
+    """Replace an invoice's lines from request data. The manager types
+    description / quantity / price — no automatic pricing."""
+    invoice.lines.all().delete()
+    for i, ld in enumerate(lines_data or []):
+        desc = str(ld.get('description', '')).strip()
+        if not desc:
+            continue
+        InvoiceLine.objects.create(
+            invoice=invoice,
+            stop_id=ld.get('stop') or None,
+            description=desc[:300],
+            quantity=_dec(ld.get('quantity', 1), '1'),
+            unit_price=_dec(ld.get('unit_price', 0)),
+            order=i,
+        )
+
+
+def _upload_invoice_pdf(pdf_bytes, public_id):
+    """Direct raw Cloudinary upload — same proven path as delivery notes
+    and confirmations (the storage layer mangles PDFs)."""
+    import os as _os
+    import tempfile as _tempfile
+    try:
+        import cloudinary.uploader
+        tmp = _tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        try:
+            tmp.write(pdf_bytes)
+            tmp.close()
+            result = cloudinary.uploader.upload(
+                tmp.name, resource_type='raw', folder='invoices',
+                public_id=public_id, use_filename=False,
+                unique_filename=False, overwrite=True)
+        finally:
+            try:
+                _os.unlink(tmp.name)
+            except OSError:
+                pass
+        return result.get('secure_url') or result.get('url')
+    except Exception as e:
+        print(f'[INVOICE] PDF upload failed ({public_id}): {e}', flush=True)
+        return None
+
+
+class ClientListCreateView(APIView):
+    """The hauler's business customers (who gets billed)."""
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        qs = Client.objects.all()
+        if request.query_params.get('active') == '1':
+            qs = qs.filter(is_active=True)
+        return Response(ClientSerializer(qs, many=True).data)
+
+    def post(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        ser = ClientSerializer(data=request.data)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data, status=201)
+        return Response(ser.errors, status=400)
+
+
+class ClientDetailView(APIView):
+    permission_classes = [IsManager]
+
+    def get(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        client = get_object_or_404(Client, pk=pk)
+        return Response(ClientSerializer(client).data)
+
+    def patch(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        client = get_object_or_404(Client, pk=pk)
+        ser = ClientSerializer(client, data=request.data, partial=True)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data)
+        return Response(ser.errors, status=400)
+
+    def delete(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        client = get_object_or_404(Client, pk=pk)
+        try:
+            client.delete()
+        except Exception:
+            # Has invoices (PROTECT) — deactivate instead of deleting,
+            # because issued documents must keep their client reference.
+            client.is_active = False
+            client.save(update_fields=['is_active'])
+            return Response({'deactivated': True})
+        return Response(status=204)
+
+
+class InvoiceListCreateView(APIView):
+    """GET ?year=&month=&client=&status=   POST creates a DRAFT with lines:
+    {client, vat_exempt?, notes?, lines: [{description, quantity,
+    unit_price, stop?}]}"""
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        qs = Invoice.objects.select_related('client').prefetch_related('lines')
+        year = request.query_params.get('year')
+        month = request.query_params.get('month')
+        if year:
+            qs = qs.filter(created_at__year=year)
+        if month:
+            qs = qs.filter(created_at__month=month)
+        if request.query_params.get('client'):
+            qs = qs.filter(client_id=request.query_params['client'])
+        if request.query_params.get('status'):
+            qs = qs.filter(status=request.query_params['status'])
+        return Response(
+            InvoiceSerializer(qs, many=True,
+                              context={'request': request}).data)
+
+    def post(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        client = get_object_or_404(Client, pk=request.data.get('client'))
+        inv = Invoice.objects.create(
+            client=client,
+            vat_exempt=bool(request.data.get('vat_exempt')),
+            notes=str(request.data.get('notes', ''))[:2000],
+        )
+        _apply_lines(inv, request.data.get('lines'))
+        inv.recalc_totals()
+        inv.save()
+        return Response(
+            InvoiceSerializer(inv, context={'request': request}).data,
+            status=201)
+
+
+class InvoiceDetailView(APIView):
+    permission_classes = [IsManager]
+
+    def get(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        inv = get_object_or_404(Invoice, pk=pk)
+        return Response(
+            InvoiceSerializer(inv, context={'request': request}).data)
+
+    def patch(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        inv = get_object_or_404(Invoice, pk=pk)
+
+        # Payment status can change at any stage.
+        touched = False
+        for field in ('status', 'payment_date', 'payment_method'):
+            if field in request.data:
+                setattr(inv, field, request.data[field])
+                touched = True
+
+        # Content is editable only while the document is a draft —
+        # an issued document is immutable.
+        if inv.status == 'draft':
+            if 'notes' in request.data:
+                inv.notes = str(request.data['notes'])[:2000]
+                touched = True
+            if 'vat_exempt' in request.data:
+                inv.vat_exempt = bool(request.data['vat_exempt'])
+                touched = True
+            if 'lines' in request.data:
+                _apply_lines(inv, request.data['lines'])
+                touched = True
+            inv.recalc_totals()
+        elif any(k in request.data for k in ('lines', 'vat_exempt')):
+            return Response(
+                {'error': 'Issued documents cannot be edited'}, status=400)
+
+        if touched:
+            inv.save()
+        return Response(
+            InvoiceSerializer(inv, context={'request': request}).data)
+
+    def delete(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        inv = get_object_or_404(Invoice, pk=pk)
+        if inv.status != 'draft':
+            return Response(
+                {'error': 'Only drafts can be deleted; cancel issued '
+                          'documents instead'}, status=400)
+        inv.delete()
+        return Response(status=204)
+
+
+class InvoiceIssueView(APIView):
+    """POST /billing/invoices/<pk>/issue/ — turn a draft into an issued
+    חשבון עסקה: assign the next number, snapshot the client, render the
+    branded PDF, upload it, lock the document."""
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        inv = get_object_or_404(Invoice, pk=pk)
+        if inv.status != 'draft':
+            return Response({'error': 'Already issued'}, status=400)
+        if not inv.lines.exists():
+            return Response({'error': 'Invoice has no lines'}, status=400)
+
+        # Next number in this document type's sequence (starts at 1001).
+        last = (Invoice.objects
+                .filter(invoice_type=inv.invoice_type)
+                .aggregate(Max('number'))['number__max'])
+        inv.number = (last or 1000) + 1
+
+        # Snapshot the client — issued documents never change retroactively.
+        inv.client_name    = inv.client.name
+        inv.client_tax_id  = inv.client.tax_id
+        inv.client_address = inv.client.address
+        inv.issue_date     = localdate()
+        inv.recalc_totals()
+
+        try:
+            from .invoice_pdf import generate_invoice_pdf
+            pdf_bytes = generate_invoice_pdf(inv)
+        except Exception as e:
+            print(f'[INVOICE] PDF generation error: {e}', flush=True)
+            pdf_bytes = None
+
+        if pdf_bytes:
+            url = _upload_invoice_pdf(
+                pdf_bytes, f'invoice_{inv.pk}_{inv.number}.pdf')
+            if url:
+                inv.pdf_file = url
+
+        inv.status = 'issued'
+        inv.save()
+        return Response(
+            InvoiceSerializer(inv, context={'request': request}).data)
+
+
+class FinanceDocumentListCreateView(APIView):
+    """The year/month document archive. GET ?year=&month=&kind=
+    POST multipart: file + kind + doc_date (+ vendor_name, description,
+    amount, notes, client)."""
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        qs = FinanceDocument.objects.all()
+        if request.query_params.get('year'):
+            qs = qs.filter(doc_date__year=request.query_params['year'])
+        if request.query_params.get('month'):
+            qs = qs.filter(doc_date__month=request.query_params['month'])
+        if request.query_params.get('kind'):
+            qs = qs.filter(kind=request.query_params['kind'])
+        return Response(
+            FinanceDocumentSerializer(qs, many=True,
+                                      context={'request': request}).data)
+
+    def post(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        f = request.FILES.get('file')
+        if f is None:
+            return Response({'error': 'file is required'}, status=400)
+        kind = request.data.get('kind')
+        if kind not in ('income', 'expense'):
+            return Response({'error': "kind must be 'income' or 'expense'"},
+                            status=400)
+        doc_date = parse_date(str(request.data.get('doc_date', '')))
+        if doc_date is None:
+            return Response({'error': 'doc_date=YYYY-MM-DD required'},
+                            status=400)
+
+        # Direct Cloudinary upload (resource_type auto: PDFs and photos of
+        # receipts both work), filed into the year/month folder structure.
+        try:
+            import cloudinary.uploader
+            result = cloudinary.uploader.upload(
+                f,
+                resource_type='auto',
+                folder=f'finance_docs/{doc_date.year}/{doc_date.month:02d}',
+                use_filename=True,
+                unique_filename=True,
+            )
+            file_url = result.get('secure_url') or result.get('url')
+        except Exception as e:
+            print(f'[FINANCE-DOC] upload failed: {e}', flush=True)
+            return Response({'error': 'upload failed'}, status=502)
+
+        doc = FinanceDocument.objects.create(
+            kind=kind,
+            doc_date=doc_date,
+            client_id=request.data.get('client') or None,
+            vendor_name=str(request.data.get('vendor_name', ''))[:200],
+            description=str(request.data.get('description', ''))[:300],
+            amount=_dec(request.data['amount']) if request.data.get('amount') else None,
+            file=file_url,
+            original_filename=getattr(f, 'name', '')[:255],
+            notes=str(request.data.get('notes', ''))[:2000],
+        )
+        return Response(
+            FinanceDocumentSerializer(doc, context={'request': request}).data,
+            status=201)
+
+
+class FinanceDocumentDeleteView(APIView):
+    permission_classes = [IsManager]
+
+    def delete(self, request, pk):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        doc = get_object_or_404(FinanceDocument, pk=pk)
+        doc.delete()
+        return Response(status=204)

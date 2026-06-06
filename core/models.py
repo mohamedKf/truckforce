@@ -33,6 +33,12 @@ class CompanySettings(models.Model):
     email                = models.EmailField(blank=True)
     address              = models.TextField(blank=True)
     default_language     = models.CharField(max_length=2, choices=LANGUAGE_CHOICES, default='he')
+
+    # ── Invoicing module (paid add-on) ────────────────────────────────
+    invoicing_enabled        = models.BooleanField(default=False,
+                                   help_text='Billing module on/off per client')
+    green_invoice_api_key    = models.CharField(max_length=200, blank=True)
+    green_invoice_api_secret = models.CharField(max_length=200, blank=True)
     crane_rounding_rule  = models.CharField(max_length=10, choices=CRANE_ROUNDING_CHOICES, default='half')
     crane_price_per_hour = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     work_start_hour      = models.TimeField(default='07:00')   # default shift start
@@ -1019,3 +1025,190 @@ class StopTask(models.Model):
 
     def __str__(self):
         return f"Task for Stop #{self.stop.order} ({self.source})"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# INVOICING MODULE
+# ──────────────────────────────────────────────────────────────────────
+
+class Client(models.Model):
+    """A business customer of the hauling company — the entity that gets
+    billed. (Not to be confused with TruckForce's own clients; this is the
+    hauler's customer: the building-materials buyer, the site, etc.)"""
+    name            = models.CharField(max_length=200)
+    tax_id          = models.CharField(max_length=20, blank=True,
+                                       help_text='ח.פ / עוסק מורשה')
+    address         = models.TextField(blank=True)
+    contact_name    = models.CharField(max_length=120, blank=True)
+    phone           = models.CharField(max_length=30, blank=True)
+    email           = models.EmailField(blank=True)
+    payment_terms   = models.CharField(max_length=50, blank=True,
+                                       help_text='e.g. שוטף+30')
+    notes           = models.TextField(blank=True)
+    green_invoice_id = models.CharField(max_length=64, blank=True,
+                                        help_text='Client id on Green Invoice')
+    is_active       = models.BooleanField(default=True)
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class Invoice(models.Model):
+    """A billing document. 'proforma' (חשבון עסקה) is generated and branded
+    by TruckForce itself — it is not a tax document, so we own its design.
+    'tax_invoice' (חשבונית מס) and 'receipt' (קבלה) are legal documents
+    issued through Green Invoice; we mirror their number, allocation
+    number, and PDF."""
+    TYPE_CHOICES = [
+        ('proforma',    'חשבון עסקה'),
+        ('tax_invoice', 'חשבונית מס'),
+        ('receipt',     'קבלה'),
+    ]
+    STATUS_CHOICES = [
+        ('draft',     'Draft'),
+        ('issued',    'Issued'),
+        ('sent',      'Sent'),
+        ('paid',      'Paid'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    client          = models.ForeignKey(Client, on_delete=models.PROTECT,
+                                        related_name='invoices')
+    invoice_type    = models.CharField(max_length=12, choices=TYPE_CHOICES,
+                                       default='proforma')
+    status          = models.CharField(max_length=10, choices=STATUS_CHOICES,
+                                       default='draft')
+    number          = models.PositiveIntegerField(null=True, blank=True,
+                          help_text='Internal sequence for proformas; '
+                                    'mirrors the provider number for tax docs')
+    issue_date      = models.DateField(null=True, blank=True)
+
+    # Snapshot of the client at issue time — an issued document must never
+    # change retroactively, even if the client record is edited later.
+    client_name     = models.CharField(max_length=200, blank=True)
+    client_tax_id   = models.CharField(max_length=20, blank=True)
+    client_address  = models.TextField(blank=True)
+
+    # Money — Decimal end to end. Line prices are BEFORE VAT (Israeli B2B
+    # convention); totals are computed from the lines at issue time.
+    subtotal        = models.DecimalField(max_digits=12, decimal_places=2,
+                                          default=0)
+    vat_rate        = models.DecimalField(max_digits=5, decimal_places=2,
+                                          default=18)
+    vat_exempt      = models.BooleanField(default=False)
+    vat_amount      = models.DecimalField(max_digits=12, decimal_places=2,
+                                          default=0)
+    total           = models.DecimalField(max_digits=12, decimal_places=2,
+                                          default=0)
+
+    # Legal/provider layer (Green Invoice)
+    provider        = models.CharField(max_length=20, default='truckforce',
+                          help_text="'truckforce' for proformas, "
+                                    "'greeninvoice' for legal docs")
+    provider_doc_id = models.CharField(max_length=64, blank=True)
+    allocation_number = models.CharField(max_length=30, blank=True,
+                                         help_text='מספר הקצאה')
+
+    pdf_file        = models.FileField(upload_to='invoices/',
+                                       storage=RawMediaCloudinaryStorage(),
+                                       max_length=500, blank=True)
+
+    payment_date    = models.DateField(null=True, blank=True)
+    payment_method  = models.CharField(max_length=50, blank=True)
+    notes           = models.TextField(blank=True)
+    created_at      = models.DateTimeField(auto_now_add=True)
+    updated_at      = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.get_invoice_type_display()} #{self.number or '—'} — {self.client_name or self.client.name}"
+
+    def recalc_totals(self):
+        """Recompute subtotal / VAT / total from the lines. Call before
+        issuing. Stays in Decimal the whole way."""
+        from decimal import Decimal
+        sub = sum((l.line_total for l in self.lines.all()), Decimal('0'))
+        self.subtotal = sub
+        rate = Decimal('0') if self.vat_exempt else (self.vat_rate or Decimal('0'))
+        self.vat_amount = (sub * rate / Decimal('100')).quantize(Decimal('0.01'))
+        self.total = sub + self.vat_amount
+
+
+class InvoiceLine(models.Model):
+    """One billed line. The manager types the description and the amount —
+    no automatic pricing. Optionally linked to a delivered Stop, which puts
+    the signed delivery note one click away from the invoice line."""
+    invoice     = models.ForeignKey(Invoice, on_delete=models.CASCADE,
+                                    related_name='lines')
+    stop        = models.ForeignKey('Stop', on_delete=models.SET_NULL,
+                                    null=True, blank=True,
+                                    related_name='invoice_lines')
+    description = models.CharField(max_length=300)
+    quantity    = models.DecimalField(max_digits=10, decimal_places=2,
+                                      default=1)
+    unit_price  = models.DecimalField(max_digits=12, decimal_places=2,
+                                      help_text='Before VAT')
+    order       = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    @property
+    def line_total(self):
+        from decimal import Decimal
+        return ((self.quantity or Decimal('0')) *
+                (self.unit_price or Decimal('0'))).quantize(Decimal('0.01'))
+
+    def __str__(self):
+        return f"{self.description} — {self.line_total}"
+
+
+class FinanceDocument(models.Model):
+    """Archive of financial documents — income invoices the business issued
+    elsewhere, and expense documents it received (fuel, parts, suppliers).
+    Not bookkeeping: a tidy, month-organized archive the accountant can be
+    handed wholesale. Files live on Cloudinary and mirror to the office PC.
+    """
+    KIND_CHOICES = [
+        ('income',  'הכנסה'),
+        ('expense', 'הוצאה'),
+    ]
+
+    kind          = models.CharField(max_length=8, choices=KIND_CHOICES)
+    doc_date      = models.DateField(help_text='Drives the year/month archive structure')
+    client        = models.ForeignKey(Client, on_delete=models.SET_NULL,
+                                      null=True, blank=True,
+                                      related_name='finance_documents')
+    vendor_name   = models.CharField(max_length=200, blank=True,
+                                     help_text='Issuer (for expenses) or payer (for income)')
+    description   = models.CharField(max_length=300, blank=True)
+    amount        = models.DecimalField(max_digits=12, decimal_places=2,
+                                        null=True, blank=True,
+                                        help_text='Optional — typed, not calculated')
+    file          = models.FileField(upload_to='finance_docs/',
+                                     storage=RawMediaCloudinaryStorage(),
+                                     max_length=500)
+    original_filename = models.CharField(max_length=255, blank=True)
+    notes         = models.TextField(blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-doc_date', '-created_at']
+        indexes = [models.Index(fields=['kind', 'doc_date'])]
+
+    @property
+    def year(self):
+        return self.doc_date.year if self.doc_date else None
+
+    @property
+    def month(self):
+        return self.doc_date.month if self.doc_date else None
+
+    def __str__(self):
+        return f"{self.get_kind_display()} {self.doc_date} — {self.vendor_name or self.description or self.pk}"
