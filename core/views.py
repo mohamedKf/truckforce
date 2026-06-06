@@ -4798,8 +4798,15 @@ class ScanUploadView(APIView):
             import fitz  # PyMuPDF
             pdf = fitz.open()
             for f in images[:12]:                     # sanity cap
-                img_bytes = f.read()
-                img = fitz.open(stream=img_bytes, filetype='image')
+                file_bytes = f.read()
+                if file_bytes[:5] == b'%PDF-':
+                    # An existing PDF (e.g. arrived by WhatsApp/email and
+                    # picked from the phone) — append its pages as-is.
+                    part = fitz.open(stream=file_bytes, filetype='pdf')
+                    pdf.insert_pdf(part)
+                    part.close()
+                    continue
+                img = fitz.open(stream=file_bytes, filetype='image')
                 rect = img[0].rect
                 page_pdf = fitz.open('pdf', img.convert_to_pdf())
                 page = pdf.new_page(width=rect.width, height=rect.height)

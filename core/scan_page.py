@@ -85,7 +85,10 @@ SCAN_HTML = r"""<!DOCTYPE html>
 
   <div class="card">
     <button class="snap" onclick="document.getElementById('cam').click()">📷 צלם עמוד</button>
-    <input id="cam" type="file" accept="image/*" capture="environment" hidden>
+    <button class="snap" style="background:#2A2A2A;color:var(--text);margin-top:8px"
+            onclick="document.getElementById('pick').click()">📁 בחר קובץ (PDF / תמונה)</button>
+    <input id="cam"  type="file" accept="image/*" capture="environment" hidden>
+    <input id="pick" type="file" accept="image/*,application/pdf" multiple hidden>
     <div class="pages" id="pages"></div>
   </div>
 
@@ -116,12 +119,14 @@ function setKind(k) {
   refresh();
 }
 
-document.getElementById('cam').addEventListener('change', e => {
-  for (const f of e.target.files) pages.push(f);
-  e.target.value = '';
-  renderPages();
-  refresh();
-});
+for (const id of ['cam', 'pick']) {
+  document.getElementById(id).addEventListener('change', e => {
+    for (const f of e.target.files) pages.push(f);
+    e.target.value = '';
+    renderPages();
+    refresh();
+  });
+}
 
 function renderPages() {
   const box = document.getElementById('pages');
@@ -129,8 +134,16 @@ function renderPages() {
   pages.forEach((f, i) => {
     const d = document.createElement('div');
     d.className = 'pg';
-    const img = document.createElement('img');
-    img.src = URL.createObjectURL(f);
+    let img;
+    if (f.type === 'application/pdf') {
+      img = document.createElement('div');
+      img.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;' +
+                          'justify-content:center;font-size:30px;background:#2A2A2A';
+      img.textContent = '📄';
+    } else {
+      img = document.createElement('img');
+      img.src = URL.createObjectURL(f);
+    }
     const x = document.createElement('button');
     x.className = 'x'; x.textContent = '✕';
     x.onclick = () => { pages.splice(i, 1); renderPages(); refresh(); };
@@ -156,7 +169,8 @@ async function send() {
   pages.forEach(f => fd.append('images', f, f.name || 'page.jpg'));
 
   try {
-    const r = await fetch(`/api/scan/${TOKEN}/upload/`, { method:'POST', body: fd });
+    // relative to the page URL → adapts to any server mount
+    const r = await fetch('upload/', { method:'POST', body: fd });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = document.getElementById('doc_date').value;
     document.getElementById('done-sub').textContent =
