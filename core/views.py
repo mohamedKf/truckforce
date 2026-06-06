@@ -222,8 +222,15 @@ class CompanySettingsView(APIView):
             return Response({'error': 'Managers only'}, status=403)
         # Strip out env-only fields — they can't be saved to DB
         safe_data = {k: v for k, v in request.data.items()
-                     if k not in ('registration_code', 'registration_enabled')}
+                     if k not in ('registration_code', 'registration_enabled',
+                                  'company_logo')}
         obj = CompanySettings.objects.first()
+        # Logo arrives as a multipart file (the serializer's company_logo is
+        # a read-only URL field, so the file is handled directly here).
+        logo = request.FILES.get('company_logo')
+        if logo is not None:
+            obj.company_logo = logo
+            obj.save(update_fields=['company_logo'])
         ser = CompanySettingsSerializer(obj, data=safe_data, partial=True)
         ser.is_valid(raise_exception=True)
         ser.save()
@@ -4394,8 +4401,10 @@ from .serializers import (ClientSerializer, InvoiceSerializer,
 
 def _invoicing_guard():
     """Returns a 403 Response when the billing module is off, else None.
-    One flag in CompanySettings — flipped when the client pays for the
-    add-on; no redeploy needed."""
+    RESERVED for the Green Invoice integration (legal tax documents) —
+    manual proformas, clients, and the archive are all base-package and
+    unguarded. Flip CompanySettings.invoicing_enabled when a client pays
+    for the Green Invoice add-on; no redeploy needed."""
     co = CompanySettings.objects.first()
     if co is None or not co.invoicing_enabled:
         return Response(
@@ -4460,18 +4469,12 @@ class ClientListCreateView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         qs = Client.objects.all()
         if request.query_params.get('active') == '1':
             qs = qs.filter(is_active=True)
         return Response(ClientSerializer(qs, many=True).data)
 
     def post(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         ser = ClientSerializer(data=request.data)
         if ser.is_valid():
             ser.save()
@@ -4483,16 +4486,10 @@ class ClientDetailView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         client = get_object_or_404(Client, pk=pk)
         return Response(ClientSerializer(client).data)
 
     def patch(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         client = get_object_or_404(Client, pk=pk)
         ser = ClientSerializer(client, data=request.data, partial=True)
         if ser.is_valid():
@@ -4501,9 +4498,6 @@ class ClientDetailView(APIView):
         return Response(ser.errors, status=400)
 
     def delete(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         client = get_object_or_404(Client, pk=pk)
         try:
             client.delete()
@@ -4523,9 +4517,6 @@ class InvoiceListCreateView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         qs = Invoice.objects.select_related('client').prefetch_related('lines')
         year = request.query_params.get('year')
         month = request.query_params.get('month')
@@ -4542,9 +4533,6 @@ class InvoiceListCreateView(APIView):
                               context={'request': request}).data)
 
     def post(self, request):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         client = get_object_or_404(Client, pk=request.data.get('client'))
         inv = Invoice.objects.create(
             client=client,
@@ -4563,17 +4551,11 @@ class InvoiceDetailView(APIView):
     permission_classes = [IsManager]
 
     def get(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         inv = get_object_or_404(Invoice, pk=pk)
         return Response(
             InvoiceSerializer(inv, context={'request': request}).data)
 
     def patch(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         inv = get_object_or_404(Invoice, pk=pk)
 
         # Payment status can change at any stage.
@@ -4606,9 +4588,6 @@ class InvoiceDetailView(APIView):
             InvoiceSerializer(inv, context={'request': request}).data)
 
     def delete(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         inv = get_object_or_404(Invoice, pk=pk)
         if inv.status != 'draft':
             return Response(
@@ -4625,9 +4604,6 @@ class InvoiceIssueView(APIView):
     permission_classes = [IsManager]
 
     def post(self, request, pk):
-        guard = _invoicing_guard()
-        if guard:
-            return guard
         inv = get_object_or_404(Invoice, pk=pk)
         if inv.status != 'draft':
             return Response({'error': 'Already issued'}, status=400)
