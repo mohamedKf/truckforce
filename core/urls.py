@@ -135,4 +135,8 @@ urlpatterns = [
     path('billing/invoices/<int:pk>/',       views.InvoiceDetailView.as_view()),
     path('billing/finance-docs/',            views.FinanceDocumentListCreateView.as_view()),
     path('billing/finance-docs/<int:pk>/',   views.FinanceDocumentDeleteView.as_view()),
+    path('billing/finance-docs/export-pdf/', views.FinanceExportPDFView.as_view()),
+    path('billing/scan-qr/',                 views.ScanQRView.as_view()),
+    path('scan/<str:token>/',                views.scan_page_view),
+    path('scan/<str:token>/upload/',         views.ScanUploadView.as_view()),
 ]

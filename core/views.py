@@ -4429,7 +4429,7 @@ def _apply_lines(invoice, lines_data):
         )
 
 
-def _upload_invoice_pdf(pdf_bytes, public_id):
+def _upload_invoice_pdf(pdf_bytes, public_id, folder='invoices'):
     """Direct raw Cloudinary upload — same proven path as delivery notes
     and confirmations (the storage layer mangles PDFs)."""
     import os as _os
@@ -4441,7 +4441,7 @@ def _upload_invoice_pdf(pdf_bytes, public_id):
             tmp.write(pdf_bytes)
             tmp.close()
             result = cloudinary.uploader.upload(
-                tmp.name, resource_type='raw', folder='invoices',
+                tmp.name, resource_type='raw', folder=folder,
                 public_id=public_id, use_filename=False,
                 unique_filename=False, overwrite=True)
         finally:
@@ -4745,3 +4745,202 @@ class FinanceDocumentDeleteView(APIView):
         doc = get_object_or_404(FinanceDocument, pk=pk)
         doc.delete()
         return Response(status=204)
+
+
+# ──────────────────────────────────────────────
+# MOBILE SCAN PAGE + ARCHIVE EXPORT
+# ──────────────────────────────────────────────
+
+def _get_or_create_scan_token():
+    import secrets
+    co = CompanySettings.objects.first()
+    if co is None:
+        return None
+    if not co.scan_token:
+        co.scan_token = secrets.token_urlsafe(24)
+        co.save(update_fields=['scan_token'])
+    return co.scan_token
+
+
+def _scan_token_valid(token: str) -> bool:
+    co = CompanySettings.objects.first()
+    return bool(co and co.invoicing_enabled and co.scan_token
+                and token == co.scan_token)
+
+
+def scan_page_view(request, token):
+    """Serves the mobile scanner page. The token in the URL is the auth —
+    upload-only, regenerable, no read access."""
+    from django.http import HttpResponse
+    if not _scan_token_valid(token):
+        return HttpResponse('<h2 style="font-family:sans-serif">Link expired '
+                            'or invalid</h2>', status=403)
+    from .scan_page import render_scan_page
+    return HttpResponse(render_scan_page(token))
+
+
+class ScanUploadView(APIView):
+    """POST /scan/<token>/upload/ — photos in, archived PDF out.
+    multipart: images (1..N) + kind + doc_date (+ vendor_name, amount).
+    The photos are merged into one PDF via PyMuPDF, uploaded to
+    finance_docs/<year>/<month>/, and recorded as a FinanceDocument."""
+    permission_classes = []          # the token IS the auth
+    authentication_classes = []
+
+    def post(self, request, token):
+        if not _scan_token_valid(token):
+            return Response({'error': 'invalid token'}, status=403)
+
+        images = request.FILES.getlist('images')
+        if not images:
+            return Response({'error': 'no images'}, status=400)
+        kind = request.data.get('kind')
+        if kind not in ('income', 'expense'):
+            return Response({'error': 'bad kind'}, status=400)
+        doc_date = parse_date(str(request.data.get('doc_date', '')))
+        if doc_date is None:
+            doc_date = localdate()
+
+        # Photos → one PDF (each photo becomes a page at its own size).
+        try:
+            import fitz  # PyMuPDF
+            pdf = fitz.open()
+            for f in images[:12]:                     # sanity cap
+                img_bytes = f.read()
+                img = fitz.open(stream=img_bytes, filetype='image')
+                rect = img[0].rect
+                page_pdf = fitz.open('pdf', img.convert_to_pdf())
+                page = pdf.new_page(width=rect.width, height=rect.height)
+                page.show_pdf_page(rect, page_pdf, 0)
+                img.close()
+                page_pdf.close()
+            pdf_bytes = pdf.tobytes(deflate=True)
+            pdf.close()
+        except Exception as e:
+            print(f'[SCAN] photo->pdf failed: {e}', flush=True)
+            return Response({'error': 'pdf conversion failed'}, status=500)
+
+        url = _upload_invoice_pdf(
+            pdf_bytes,
+            f'scan_{kind}_{doc_date.isoformat()}_'
+            f'{timezone.now().strftime("%H%M%S")}.pdf',
+            folder=f'finance_docs/{doc_date.year}/{doc_date.month:02d}')
+        if url is None:
+            return Response({'error': 'upload failed'}, status=502)
+
+        doc = FinanceDocument.objects.create(
+            kind=kind,
+            doc_date=doc_date,
+            vendor_name=str(request.data.get('vendor_name', ''))[:200],
+            amount=_dec(request.data['amount']) if request.data.get('amount') else None,
+            file=url,
+            original_filename=f'scan_{len(images)}pages.pdf',
+            notes='נסרק מהנייד',
+        )
+        return Response({'ok': True, 'id': doc.id}, status=201)
+
+
+class ScanQRView(APIView):
+    """GET /billing/scan-qr/ — returns the scan URL and a QR PNG (base64)
+    for the desktop to display/print. POST regenerates the token (kills
+    the old QR instantly)."""
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        token = _get_or_create_scan_token()
+        if not token:
+            return Response({'error': 'no company settings'}, status=400)
+        scan_url = request.build_absolute_uri(f'/api/scan/{token}/')
+
+        qr_b64 = None
+        try:
+            import qrcode
+            import io as _io
+            import base64 as _b64
+            img = qrcode.make(scan_url, box_size=10, border=2)
+            buf = _io.BytesIO()
+            img.save(buf, format='PNG')
+            qr_b64 = _b64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            print(f'[SCAN-QR] generation failed: {e}', flush=True)
+
+        return Response({'url': scan_url, 'qr_png_base64': qr_b64})
+
+    def post(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        import secrets
+        co = CompanySettings.objects.first()
+        co.scan_token = secrets.token_urlsafe(24)
+        co.save(update_fields=['scan_token'])
+        return self.get(request)
+
+
+class FinanceExportPDFView(APIView):
+    """GET /billing/finance-docs/export-pdf/?year=&month=[&kind=] —
+    merges the whole month's archive into ONE PDF for the accountant.
+    PDFs are appended as-is; image documents become pages."""
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        guard = _invoicing_guard()
+        if guard:
+            return guard
+        year = request.query_params.get('year')
+        month = request.query_params.get('month')
+        if not year or not month:
+            return Response({'error': 'year and month required'}, status=400)
+        qs = FinanceDocument.objects.filter(
+            doc_date__year=year, doc_date__month=month)
+        if request.query_params.get('kind'):
+            qs = qs.filter(kind=request.query_params['kind'])
+        qs = qs.order_by('doc_date', 'id')
+        if not qs.exists():
+            return Response({'error': 'no documents for this month'},
+                            status=404)
+
+        import requests as _rq
+        import fitz
+        merged = fitz.open()
+        added = 0
+        for doc in qs:
+            try:
+                name = str(getattr(doc.file, 'name', '') or '')
+                url = name if name.startswith('http') else doc.file.url
+                resp = _rq.get(url, timeout=30)
+                if resp.status_code != 200 or not resp.content:
+                    continue
+                data = resp.content
+                if data[:5] == b'%PDF-':
+                    part = fitz.open(stream=data, filetype='pdf')
+                    merged.insert_pdf(part)
+                    part.close()
+                else:
+                    img = fitz.open(stream=data, filetype='image')
+                    rect = img[0].rect
+                    page_pdf = fitz.open('pdf', img.convert_to_pdf())
+                    page = merged.new_page(width=rect.width,
+                                           height=rect.height)
+                    page.show_pdf_page(rect, page_pdf, 0)
+                    img.close()
+                    page_pdf.close()
+                added += 1
+            except Exception as e:
+                print(f'[EXPORT] doc {doc.id} skipped: {e}', flush=True)
+
+        if added == 0:
+            merged.close()
+            return Response({'error': 'no documents could be merged'},
+                            status=502)
+
+        out = merged.tobytes(deflate=True)
+        merged.close()
+        from django.http import HttpResponse
+        resp = HttpResponse(out, content_type='application/pdf')
+        resp['Content-Disposition'] = (
+            f'attachment; filename="TruckForce_{year}_{int(month):02d}.pdf"')
+        return resp

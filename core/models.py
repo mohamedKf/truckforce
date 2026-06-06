@@ -37,8 +37,13 @@ class CompanySettings(models.Model):
     # ── Invoicing module (paid add-on) ────────────────────────────────
     invoicing_enabled        = models.BooleanField(default=False,
                                    help_text='Billing module on/off per client')
-    green_invoice_api_key    = models.CharField(max_length=200, blank=True)
-    green_invoice_api_secret = models.CharField(max_length=200, blank=True)
+    scan_token               = models.CharField(max_length=64, blank=True,
+                                   help_text='Upload-only token for the mobile scan page (QR)')
+    # NOTE: Green Invoice API credentials are intentionally NOT model
+    # fields — the settings serializer exposes __all__, and secrets don't
+    # belong in DB rows or backups. They live in Railway environment
+    # variables: GREEN_INVOICE_API_KEY / GREEN_INVOICE_API_SECRET, read
+    # via decouple in config/settings.py when the provider is built.
     crane_rounding_rule  = models.CharField(max_length=10, choices=CRANE_ROUNDING_CHOICES, default='half')
     crane_price_per_hour = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     work_start_hour      = models.TimeField(default='07:00')   # default shift start
