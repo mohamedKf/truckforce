@@ -89,6 +89,11 @@ def generate_invoice_pdf(invoice) -> bytes:
                   _style('co', fontSize=17, textColor=DARK,
                          alignment=TA_RIGHT)),
     ]
+    company_tax = (getattr(co, 'company_tax_id', '') if co else '') or ''
+    if company_tax:
+        identity.append(Paragraph(f"{_rtl('ח.פ / עוסק')}: {company_tax}",
+                        _style('cot', fontSize=9, textColor=MUTED,
+                               alignment=TA_RIGHT)))
     contact_bits = " • ".join(b for b in [company_phone, company_email] if b)
     if contact_bits:
         identity.append(Paragraph(contact_bits,

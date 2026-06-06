@@ -79,6 +79,9 @@ SCAN_HTML = r"""<!DOCTYPE html>
     <label>ספק / לקוח (לא חובה)</label>
     <input type="text" id="vendor" placeholder="שם העסק שעל המסמך">
 
+    <label>ח.פ / ת.ז (לא חובה)</label>
+    <input type="text" id="vtax" inputmode="numeric" placeholder="מספר העוסק שעל המסמך">
+
     <label>סכום (לא חובה)</label>
     <input type="number" id="amount" inputmode="decimal" placeholder="₪">
   </div>
@@ -164,6 +167,7 @@ async function send() {
   fd.append('kind', kind);
   fd.append('doc_date', document.getElementById('doc_date').value);
   fd.append('vendor_name', document.getElementById('vendor').value || '');
+  fd.append('vendor_tax_id', document.getElementById('vtax').value || '');
   const amt = document.getElementById('amount').value;
   if (amt) fd.append('amount', amt);
   pages.forEach(f => fd.append('images', f, f.name || 'page.jpg'));
@@ -188,6 +192,7 @@ async function send() {
 function reset() {
   pages = []; renderPages();
   document.getElementById('vendor').value = '';
+  document.getElementById('vtax').value = '';
   document.getElementById('amount').value = '';
   document.getElementById('send').textContent = 'שמור בארכיון ✓';
   refresh();

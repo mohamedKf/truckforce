@@ -37,6 +37,8 @@ class CompanySettings(models.Model):
     # ── Invoicing module (paid add-on) ────────────────────────────────
     invoicing_enabled        = models.BooleanField(default=False,
                                    help_text='Billing module on/off per client')
+    company_tax_id           = models.CharField(max_length=20, blank=True,
+                                   help_text='ח.פ / עוסק מורשה of the company — printed on invoices')
     scan_token               = models.CharField(max_length=64, blank=True,
                                    help_text='Upload-only token for the mobile scan page (QR)')
     # NOTE: Green Invoice API credentials are intentionally NOT model
@@ -1192,6 +1194,8 @@ class FinanceDocument(models.Model):
                                       related_name='finance_documents')
     vendor_name   = models.CharField(max_length=200, blank=True,
                                      help_text='Issuer (for expenses) or payer (for income)')
+    vendor_tax_id = models.CharField(max_length=20, blank=True,
+                                     help_text='ח.פ / ת.ז on the document')
     description   = models.CharField(max_length=300, blank=True)
     amount        = models.DecimalField(max_digits=12, decimal_places=2,
                                         null=True, blank=True,
