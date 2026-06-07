@@ -1238,10 +1238,16 @@ class DocumentListCreateView(APIView):
     def post(self, request):
         if not hasattr(request, 'manager'):
             return Response({'error': 'Managers only'}, status=403)
+        # `file` is a SerializerMethodField (read-only) on the serializer,
+        # so DRF DROPS the uploaded file on save. Pull it from FILES and
+        # hand it to the model explicitly.
+        upload = request.FILES.get('file')
+        if upload is None:
+            return Response({'error': 'file is required'}, status=400)
         ser = DocumentSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        ser.save(uploaded_by=request.manager)
-        return Response(ser.data, status=201)
+        doc = ser.save(uploaded_by=request.manager, file=upload)
+        return Response(DocumentSerializer(doc).data, status=201)
 
 
 class DocumentDetailView(APIView):
