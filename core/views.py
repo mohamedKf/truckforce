@@ -490,7 +490,8 @@ class ScheduleDetailView(APIView):
         obj = self.get_object(pk)
         if not obj:
             return Response({'error': 'Not found'}, status=404)
-        if hasattr(request, 'driver') and obj.driver_id != request.driver.id:
+        if hasattr(request, 'driver') and request.driver is not None \
+                and obj.driver_id != request.driver.id:
             return Response({'error': 'Forbidden'}, status=403)
         return Response(DailyScheduleSerializer(obj).data)
 
@@ -1089,7 +1090,7 @@ class CraneSessionListView(APIView):
 
     def get(self, request):
         qs = CraneSession.objects.all()
-        if hasattr(request, 'driver'):
+        if hasattr(request, 'driver') and request.driver is not None:
             qs = qs.filter(driver=request.driver)
         else:
             driver_id = request.query_params.get('driver')
@@ -1147,7 +1148,7 @@ class PayrollListView(APIView):
 
     def get(self, request):
         qs = Payroll.objects.all()
-        if hasattr(request, 'driver'):
+        if hasattr(request, 'driver') and request.driver is not None:
             qs = qs.filter(driver=request.driver)
         else:
             driver_id = request.query_params.get('driver')
@@ -1164,7 +1165,8 @@ class PayrollDetailView(APIView):
             payroll = Payroll.objects.get(pk=pk)
         except Payroll.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
-        if hasattr(request, 'driver') and payroll.driver_id != request.driver.id:
+        if hasattr(request, 'driver') and request.driver is not None \
+                and payroll.driver_id != request.driver.id:
             return Response({'error': 'Forbidden'}, status=403)
         return Response(PayrollSerializer(payroll).data)
 
@@ -1222,7 +1224,7 @@ class DocumentListCreateView(APIView):
 
     def get(self, request):
         qs = Document.objects.all()
-        if hasattr(request, 'driver'):
+        if hasattr(request, 'driver') and request.driver is not None:
             qs = qs.filter(driver=request.driver)
         else:
             driver_id = request.query_params.get('driver')
