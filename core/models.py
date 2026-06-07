@@ -687,7 +687,7 @@ class Document(models.Model):
     truck       = models.ForeignKey(Truck, on_delete=models.CASCADE, null=True, blank=True, related_name='documents')
     doc_type    = models.CharField(max_length=20, choices=DOC_TYPE_CHOICES)
     title       = models.CharField(max_length=200)
-    file        = models.FileField(upload_to='documents/',
+    file        = models.FileField(upload_to='documents/', max_length=500,
                                     storage=RawMediaCloudinaryStorage())
     notes       = models.TextField(blank=True)
     uploaded_by = models.ForeignKey(Manager, on_delete=models.SET_NULL, null=True, blank=True)

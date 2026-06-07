@@ -1246,7 +1246,17 @@ class DocumentListCreateView(APIView):
             return Response({'error': 'file is required'}, status=400)
         ser = DocumentSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        doc = ser.save(uploaded_by=request.manager, file=upload)
+        # Upload explicitly and store Cloudinary's own secure_url —
+        # correct by construction, immune to storage-class URL quirks.
+        # Same proven pattern as invoices and phone scans.
+        try:
+            import cloudinary.uploader
+            res = cloudinary.uploader.upload(
+                upload, resource_type='auto', folder='documents',
+                use_filename=True, unique_filename=True)
+        except Exception as e:
+            return Response({'error': f'upload failed: {e}'}, status=502)
+        doc = ser.save(uploaded_by=request.manager, file=res['secure_url'])
         return Response(DocumentSerializer(doc).data, status=201)
 
 
