@@ -185,6 +185,9 @@ class DriverLoginView(APIView):
         token = generate_token()
         store_driver_token(token, driver.id)
         return Response({
+            'can_self_manage': (driver.can_self_manage or
+                __import__('os').environ.get('SOLO_MODE', '').lower()
+                in ('1', 'true', 'yes')),
             'token': token,
             'driver': DriverSerializer(driver).data,
         })
@@ -662,6 +665,62 @@ class StopDetailView(APIView):
         stop.delete()
         publish_event('schedules_changed', by_user_id=getattr(request.manager, 'id', None))
         return Response(status=204)
+
+
+def _self_managing_driver(request):
+    """The authenticated driver, when allowed to manage their own
+    schedules. Two ways in: the per-driver flag, OR a server-wide
+    SOLO_MODE env var — set on dedicated solo-driver Railway servers so
+    every driver there self-manages with zero per-driver setup."""
+    import os
+    d = getattr(request, 'driver', None)
+    if d is None:
+        return None
+    solo_server = os.environ.get('SOLO_MODE', '').lower() in ('1', 'true', 'yes')
+    return d if (solo_server or getattr(d, 'can_self_manage', False)) else None
+
+
+class DriverSelfScheduleView(APIView):
+    """Solo-driver mode: a driver with can_self_manage creates a
+    schedule FOR THEMSELVES (today or a future date) and adds stops to
+    it. Address coordinates come from the phone (Mapbox geocoding)."""
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request):
+        driver = _self_managing_driver(request)
+        if driver is None:
+            return Response({'error': 'Not allowed'}, status=403)
+        date_str = request.data.get('date')
+        if not date_str:
+            return Response({'error': 'date required'}, status=400)
+        schedule, _created = DailySchedule.objects.get_or_create(
+            driver=driver, date=date_str,
+            defaults={'truck': driver.assigned_truck
+                      if hasattr(driver, 'assigned_truck') else None})
+        stops = request.data.get('stops') or []
+        existing = schedule.stops.count()
+        created = []
+        for idx, st in enumerate(stops):
+            if not st.get('site_name'):
+                continue
+            stop = Stop.objects.create(
+                schedule=schedule,
+                order=existing + idx + 1,
+                site_name=st.get('site_name', ''),
+                address=st.get('address', ''),
+                latitude=st.get('latitude'),
+                longitude=st.get('longitude'),
+                notes=st.get('notes', ''),
+                contact_name=st.get('contact_name', ''),
+                contact_phone=st.get('contact_phone', ''),
+                items=st.get('items', ''),
+                stop_type=st.get('stop_type', 'delivery'),
+            )
+            created.append(stop.id)
+        return Response({
+            'schedule': schedule.id,
+            'created_stops': created,
+        }, status=201)
 
 
 class ScheduleStopsAddView(APIView):
@@ -3605,6 +3664,45 @@ def _build_tracking_url(request, token: str) -> str:
     if not base:
         base = request.build_absolute_uri('/')[:-1]
     return f"{base}/track/{token}/"
+
+
+class DriverShareTrackingView(APIView):
+    """Driver shares HIS OWN live location with a client — same public
+    tracking page the office uses, created from the phone. Optionally
+    pinned to one of the driver's own stops (ETA + header). Expires at
+    end of day."""
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request):
+        driver = getattr(request, 'driver', None)
+        if driver is None:
+            return Response({'error': 'Drivers only'}, status=403)
+        target_stop = None
+        stop_id = request.data.get('target_stop_id')
+        if stop_id:
+            try:
+                target_stop = Stop.objects.select_related('schedule').get(
+                    pk=stop_id, schedule__driver=driver)  # own stops only
+            except Stop.DoesNotExist:
+                return Response({'error': 'Stop not found'}, status=404)
+        from django.utils import timezone as tz
+        import datetime as dt
+        end_of_day = tz.localtime().replace(
+            hour=23, minute=59, second=59, microsecond=0)
+        link = TrackingLink.objects.create(
+            driver=driver,
+            created_by=None,
+            created_by_driver=True,
+            target_stop=target_stop,
+            label=request.data.get('label', ''),
+            expires_at=end_of_day,
+        )
+        base = getattr(settings, 'SITE_URL', '') or \
+            request.build_absolute_uri('/').rstrip('/')
+        return Response({
+            'token': link.token,
+            'url': f'{base}/track/{link.token}/',
+        }, status=201)
 
 
 class TrackingLinkListCreateView(APIView):

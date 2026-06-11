@@ -123,6 +123,9 @@ class Driver(models.Model):
 
     # ── Personal info ──
     full_name    = models.CharField(max_length=200)
+    # Solo-driver mode: this driver may create and edit their OWN
+    # schedules and stops from the phone (one-man businesses).
+    can_self_manage = models.BooleanField(default=False)
     id_number    = models.CharField(max_length=20, unique=True)   # Israeli ID
     email        = models.EmailField(blank=True)
     phone        = models.CharField(max_length=20, blank=True)
@@ -186,6 +189,13 @@ class Truck(models.Model):
     model              = models.CharField(max_length=100)
     year               = models.IntegerField(null=True, blank=True)
     plate_number       = models.CharField(max_length=20, unique=True)
+    # Physical dimensions for truck-aware navigation (meters). Sent to
+    # the routing API as max_height/max_width so routes avoid low
+    # bridges/tunnels and too-narrow roads. Null = route like a car.
+    height_m           = models.DecimalField(max_digits=4, decimal_places=2,
+                                             null=True, blank=True)
+    width_m            = models.DecimalField(max_digits=4, decimal_places=2,
+                                             null=True, blank=True)
     capacity_tons      = models.DecimalField(max_digits=6, decimal_places=1)
     has_crane          = models.BooleanField(default=False)
     status             = models.CharField(max_length=10, choices=STATUS_CHOICES, default='active')
@@ -965,7 +975,12 @@ class TrackingLink(models.Model):
     """
     token       = models.CharField(max_length=32, unique=True, default=_new_tracking_token)
     driver      = models.ForeignKey('Driver', on_delete=models.CASCADE, related_name='tracking_links')
-    created_by  = models.ForeignKey('Manager', on_delete=models.CASCADE, related_name='tracking_links')
+    created_by  = models.ForeignKey('Manager', on_delete=models.CASCADE,
+                                    null=True, blank=True,
+                                    related_name='tracking_links')
+    # When the DRIVER shares his own location with the client (from the
+    # phone), created_by stays empty and this flag marks the origin.
+    created_by_driver = models.BooleanField(default=False)
     target_stop = models.ForeignKey(
         'Stop',
         on_delete=models.SET_NULL,

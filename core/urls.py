@@ -38,6 +38,7 @@ urlpatterns = [
 
     # ── Schedules — specific before <int:pk> ──────────
     path('schedules/',                                  views.ScheduleListCreateView.as_view()),
+    path('schedules/self/',                             views.DriverSelfScheduleView.as_view()),
     path('schedules/today/',                            views.DriverTodayScheduleView.as_view()),
     path('schedules/by-date/<str:date>/',               views.DriverScheduleByDateView.as_view()),
     path('schedules/<int:pk>/reorder-stops/',           views.DriverReorderStopsView.as_view()),
@@ -116,6 +117,7 @@ urlpatterns = [
     # ── Public tracking links (client-facing) ─────────
     # NOTE: tracking_page (HTML) is served from /track/<token>/ at the project urls.py
     # level — see truckforce_backend/urls.py. The API endpoints below live under /api/.
+    path('tracking-links/share/',            views.DriverShareTrackingView.as_view()),
     path('tracking-links/',                  views.TrackingLinkListCreateView.as_view()),
     path('tracking-links/<int:pk>/revoke/',  views.TrackingLinkRevokeView.as_view()),
     path('track/<str:token>/data/',          views.tracking_data),
