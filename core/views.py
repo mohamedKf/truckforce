@@ -217,7 +217,8 @@ class CompanySettingsView(APIView):
         # to authenticated users is safe.
         data['mapbox_token'] = getattr(django_settings, 'MAPBOX_TOKEN', '')
         # Only admins see the current registration code — read from env, never DB
-        if hasattr(request, 'manager') and request.manager.role == 'admin':
+        if hasattr(request, 'manager') and request.manager is not None \
+                and request.manager.role == 'admin':
             data['registration_code']    = django_settings.REGISTRATION_CODE
             data['registration_enabled'] = django_settings.REGISTRATION_ENABLED
         return Response(data)
