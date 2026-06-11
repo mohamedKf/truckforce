@@ -211,6 +211,11 @@ class CompanySettingsView(APIView):
         if not obj:
             return Response({})
         data = CompanySettingsSerializer(obj).data
+        # Mapbox public token — env-only (per-tenant Railway variable).
+        # The driver app fetches it here after login to run the in-app
+        # map/navigation. pk.* tokens are public by design, so exposing
+        # to authenticated users is safe.
+        data['mapbox_token'] = getattr(django_settings, 'MAPBOX_TOKEN', '')
         # Only admins see the current registration code — read from env, never DB
         if hasattr(request, 'manager') and request.manager.role == 'admin':
             data['registration_code']    = django_settings.REGISTRATION_CODE
@@ -222,7 +227,8 @@ class CompanySettingsView(APIView):
             return Response({'error': 'Managers only'}, status=403)
         # Strip out env-only fields — they can't be saved to DB
         safe_data = {k: v for k, v in request.data.items()
-                     if k not in ('registration_code', 'registration_enabled',
+                     if k not in ('mapbox_token',
+                                  'registration_code', 'registration_enabled',
                                   'company_logo')}
         obj = CompanySettings.objects.first()
         # Logo arrives as a multipart file (the serializer's company_logo is
