@@ -687,9 +687,11 @@ class DriverSelfScheduleView(APIView):
     permission_classes = [IsManagerOrDriver]
 
     def post(self, request):
-        driver = _self_managing_driver(request)
+        # Any driver may add stops to HIS OWN day — basic ability, no
+        # special permission. (He still can't touch anyone else's route.)
+        driver = getattr(request, 'driver', None)
         if driver is None:
-            return Response({'error': 'Not allowed'}, status=403)
+            return Response({'error': 'Drivers only'}, status=403)
         date_str = request.data.get('date')
         if not date_str:
             return Response({'error': 'date required'}, status=400)
@@ -3686,7 +3688,7 @@ class DriverShareTrackingView(APIView):
             except Stop.DoesNotExist:
                 return Response({'error': 'Stop not found'}, status=404)
         from django.utils import timezone as tz
-        import datetime as dt
+        from django.conf import settings as django_settings
         end_of_day = tz.localtime().replace(
             hour=23, minute=59, second=59, microsecond=0)
         link = TrackingLink.objects.create(
@@ -3697,7 +3699,7 @@ class DriverShareTrackingView(APIView):
             label=request.data.get('label', ''),
             expires_at=end_of_day,
         )
-        base = getattr(settings, 'SITE_URL', '') or \
+        base = getattr(django_settings, 'SITE_URL', '') or \
             request.build_absolute_uri('/').rstrip('/')
         return Response({
             'token': link.token,
