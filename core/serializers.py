@@ -252,6 +252,40 @@ class StopPhotoSerializer(serializers.ModelSerializer):
         return _abs_url(obj.image, self.context.get('request'))
 
 
+class PackageSerializer(serializers.ModelSerializer):
+    invoice_file_url = serializers.SerializerMethodField()
+
+    def get_invoice_file_url(self, obj):
+        return _abs_url(obj.invoice_file, self.context.get('request'))
+
+    class Meta:
+        model = Package
+        fields = [
+            'id', 'stop', 'product_name', 'product_code', 'tmsh_number',
+            'barcode', 'quantity_pallets', 'quantity_units', 'weight_kg',
+            'invoice_number', 'checker_name', 'returns',
+            'is_loaded', 'is_delivered', 'status',
+            'loaded_at', 'delivered_at', 'notes', 'invoice_file_url',
+        ]
+        read_only_fields = ['loaded_at', 'delivered_at']
+
+
+class DeliverySheetSerializer(serializers.ModelSerializer):
+    original_pdf_url = serializers.SerializerMethodField()
+    signed_pdf_url   = serializers.SerializerMethodField()
+
+    def get_original_pdf_url(self, obj):
+        return _abs_url(obj.original_pdf, self.context.get('request'))
+
+    def get_signed_pdf_url(self, obj):
+        return _abs_url(obj.signed_pdf, self.context.get('request'))
+
+    class Meta:
+        model = DeliverySheet
+        fields = ['id', 'schedule', 'original_pdf_url', 'signed_pdf_url',
+                  'signature_count', 'created_at', 'updated_at']
+
+
 class StopSerializer(serializers.ModelSerializer):
     waze_link        = serializers.CharField(read_only=True)
     google_maps_link = serializers.CharField(read_only=True)
@@ -266,6 +300,12 @@ class StopSerializer(serializers.ModelSerializer):
 
     def get_delivery_note_url(self, obj):
         return _abs_url(obj.delivery_note_pdf, self.context.get('request'))
+
+    packages          = PackageSerializer(many=True, read_only=True)
+    invoice_file_url  = serializers.SerializerMethodField()
+
+    def get_invoice_file_url(self, obj):
+        return _abs_url(obj.invoice_file, self.context.get('request'))
 
     # Signed confirmation PDF (set once the driver collects a signature).
     confirmation_pdf_url = serializers.SerializerMethodField()
@@ -287,7 +327,9 @@ class StopSerializer(serializers.ModelSerializer):
             'notes', 'status', 'completed_at', 'skip_reason',
             # ── Stop-type / pickup-delivery linkage ──
             'stop_type', 'items',
-            'contact_name', 'contact_phone',
+            'contact_name', 'contact_phone', 'contact_email',
+            'invoice_number', 'invoice_file_url', 'invoice_signed',
+            'packages',
             'pickup_stop',
             'driver_note',
             'delivery_note_url',
@@ -339,7 +381,8 @@ class StopCreateNestedSerializer(serializers.ModelSerializer):
             'allow_driver_reorder',
             # ── Stop-type / pickup-delivery linkage ──
             'stop_type', 'items',
-            'contact_name', 'contact_phone',
+            'contact_name', 'contact_phone', 'contact_email',
+            'invoice_number', 'invoice_signed',
             'pickup_stop',
         ]
         extra_kwargs = {

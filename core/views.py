@@ -25,9 +25,10 @@ from .models import (
     CompanySettings, Manager, Driver, Truck,
     DailySchedule, Stop, Attendance, CraneSession,
     Payroll, NotificationLog, Document,
-    TrackingLink, StopTask,
+    TrackingLink, StopTask, Package, DeliverySheet,
 )
 from .serializers import AttendanceFixRequestSerializer
+from .serializers import PackageSerializer, DeliverySheetSerializer
 from .serializers import (
     CompanySettingsSerializer,
     ManagerSerializer, ManagerLoginSerializer,
@@ -219,6 +220,10 @@ class CompanySettingsView(APIView):
         # map/navigation. pk.* tokens are public by design, so exposing
         # to authenticated users is safe.
         data['mapbox_token'] = getattr(django_settings, 'MAPBOX_TOKEN', '')
+        # Google geocoding key — same per-tenant env pattern. Used by the
+        # app's search bar for Israeli address accuracy. Restricted to the
+        # Geocoding API server-side, safe to hand to authenticated users.
+        data['google_geocoding_key'] = getattr(django_settings, 'GOOGLE_GEOCODING_KEY', '')
         # Only admins see the current registration code — read from env, never DB
         if hasattr(request, 'manager') and request.manager is not None \
                 and request.manager.role == 'admin':
@@ -231,7 +236,7 @@ class CompanySettingsView(APIView):
             return Response({'error': 'Managers only'}, status=403)
         # Strip out env-only fields — they can't be saved to DB
         safe_data = {k: v for k, v in request.data.items()
-                     if k not in ('mapbox_token',
+                     if k not in ('mapbox_token', 'google_geocoding_key',
                                   'registration_code', 'registration_enabled',
                                   'company_logo')}
         obj = CompanySettings.objects.first()
@@ -5061,3 +5066,102 @@ class FinanceExportPDFView(APIView):
         resp['Content-Disposition'] = (
             f'attachment; filename="TruckForce_{year}_{int(month):02d}.pdf"')
         return resp
+
+
+# ══════════════════════════════════════════════════════════════════
+# PACKAGES (package_delivery stops) — load/deliver flow + leftover log
+# ══════════════════════════════════════════════════════════════════
+class StopPackagesView(APIView):
+    """GET packages for a stop; POST creates one (manager or the
+    assigned driver, e.g. AI-confirmed list)."""
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request, stop_id):
+        pkgs = Package.objects.filter(stop_id=stop_id)
+        return Response(PackageSerializer(pkgs, many=True,
+                        context={'request': request}).data)
+
+    def post(self, request, stop_id):
+        try:
+            stop = Stop.objects.get(pk=stop_id)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Stop not found'}, status=404)
+        data = request.data.copy()
+        data['stop'] = stop.id
+        ser = PackageSerializer(data=data, context={'request': request})
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data, status=201)
+
+
+class SchedulePackagesView(APIView):
+    """All packages for a whole day's schedule, grouped by stop — the
+    phone's day list (stop → its packages with load/deliver checkboxes)."""
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request, schedule_id):
+        stops = (Stop.objects.filter(schedule_id=schedule_id)
+                 .order_by('order').prefetch_related('packages'))
+        out = []
+        for st in stops:
+            pkgs = PackageSerializer(st.packages.all(), many=True,
+                                     context={'request': request}).data
+            out.append({
+                'stop_id':   st.id,
+                'order':     st.order,
+                'site_name': st.site_name,
+                'address':   st.address,
+                'status':    st.status,
+                'packages':  pkgs,
+            })
+        return Response(out)
+
+
+class PackageDetailView(APIView):
+    """PATCH a single package: toggle is_loaded / is_delivered / status.
+    Sets the matching timestamp automatically."""
+    permission_classes = [IsManagerOrDriver]
+
+    def patch(self, request, pk):
+        try:
+            pkg = Package.objects.get(pk=pk)
+        except Package.DoesNotExist:
+            return Response({'error': 'Package not found'}, status=404)
+        ser = PackageSerializer(pkg, data=request.data, partial=True,
+                                context={'request': request})
+        ser.is_valid(raise_exception=True)
+        obj = ser.save()
+        # keep timestamps + status coherent with the flags
+        changed = False
+        if obj.is_loaded and obj.loaded_at is None:
+            obj.loaded_at = timezone.now()
+            if obj.status == 'pending':
+                obj.status = 'loaded'
+            changed = True
+        if obj.is_delivered and obj.delivered_at is None:
+            obj.delivered_at = timezone.now()
+            obj.status = 'delivered'
+            changed = True
+        if changed:
+            obj.save()
+        return Response(PackageSerializer(obj, context={'request': request}).data)
+
+    def delete(self, request, pk):
+        Package.objects.filter(pk=pk).delete()
+        return Response(status=204)
+
+
+class LeftoverPackagesView(APIView):
+    """The leftover log: packages not yet loaded/delivered for a driver —
+    what didn't fit and rolls to a later trip, by code."""
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request):
+        driver = getattr(request, 'driver', None)
+        qs = Package.objects.filter(
+            is_delivered=False,
+        ).exclude(status='delivered').select_related('stop', 'stop__schedule')
+        if driver is not None:
+            qs = qs.filter(stop__schedule__driver=driver)
+        return Response(PackageSerializer(qs, many=True,
+                        context={'request': request}).data)

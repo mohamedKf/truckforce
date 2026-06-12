@@ -119,6 +119,11 @@ CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL', default=True, cast=bool)
 # so a restart is required after changing the env var.
 MAPBOX_TOKEN = config('MAPBOX_TOKEN', default='')
 
+# Google Geocoding: per-client key (server-controlled, billed in their fee).
+# Used by the driver app's search bar for accurate Israeli address lookup,
+# and later by the AI delivery-sheet reader to resolve addresses → coords.
+GOOGLE_GEOCODING_KEY = config('GOOGLE_GEOCODING_KEY', default='')
+
 # SITE_URL: absolute base URL of this Django deployment. Used by
 # tracking_page (HTML) to build links the client can share. Falls back to
 # whatever request.build_absolute_uri returns if unset.

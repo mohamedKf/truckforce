@@ -282,6 +282,7 @@ class Stop(models.Model):
         ('pickup', 'איסוף'),  # Pick something up
         ('service', 'שירות'),  # Do work here (crane, repair, tow dropoff)
         ('both', 'איסוף + מסירה'),  # Pick up AND deliver at same location
+        ('package_delivery', 'מסירת חבילות'),  # Multi-package delivery with load/check flow
     ]
 
     schedule        = models.ForeignKey(DailySchedule, on_delete=models.CASCADE, related_name='stops')
@@ -319,6 +320,14 @@ class Stop(models.Model):
     # Contact at this stop
     contact_name = models.CharField(max_length=100, blank=True)
     contact_phone = models.CharField(max_length=20, blank=True)
+    contact_email = models.EmailField(blank=True,
+        help_text="Receiver email — delivery note / invoice can be emailed here")
+    # Invoice for THIS stop (one per stop). The file may be a generated
+    # PDF or a photo of a paper invoice turned into PDF.
+    invoice_number = models.CharField(max_length=50, blank=True)
+    invoice_file   = models.FileField(upload_to='invoices/', max_length=500,
+        storage=RawMediaCloudinaryStorage(), null=True, blank=True)
+    invoice_signed = models.BooleanField(default=False)
 
     # Pre-uploaded delivery-note PDF — the document the client will sign
     # later. Manager attaches it when creating/editing the stop in the
@@ -377,6 +386,73 @@ class Stop(models.Model):
         if not (self.actual_arrival and self.expected_arrival):
             return False
         return self.actual_arrival.time() > self.expected_arrival
+
+
+class DeliverySheet(models.Model):
+    """The master delivery manifest for a day's assignment — the paper
+    the driver photographs. ONE per schedule. Starts as the blank
+    original; as each stop's receiver signs, the newest signed PDF
+    REPLACES the previous signed copy, so we keep exactly two artifacts:
+    the empty original and the running all-signatures copy."""
+    schedule       = models.OneToOneField('DailySchedule',
+                        on_delete=models.CASCADE, related_name='delivery_sheet')
+    original_pdf   = models.FileField(upload_to='delivery_sheets/', max_length=500,
+                        storage=RawMediaCloudinaryStorage(), null=True, blank=True,
+                        help_text="Blank manifest — photo→PDF or office upload")
+    signed_pdf     = models.FileField(upload_to='delivery_sheets/', max_length=500,
+                        storage=RawMediaCloudinaryStorage(), null=True, blank=True,
+                        help_text="Running copy — replaced after each signature")
+    signature_count = models.PositiveIntegerField(default=0)
+    created_at     = models.DateTimeField(auto_now_add=True)
+    updated_at     = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"DeliverySheet for schedule {self.schedule_id}"
+
+
+class Package(models.Model):
+    """A single item/line delivered to a stop. Many packages per stop;
+    the truck loads them across stops and can fill before all fit —
+    unloaded packages stay (is_loaded=False) and roll to a later trip."""
+    STATUS_CHOICES = [
+        ('pending',   'ממתין'),       # not yet loaded
+        ('loaded',    'נטען'),         # on the truck
+        ('delivered', 'נמסר'),         # handed over + checked at stop
+        ('returned',  'הוחזר'),        # came back / refused
+        ('left',      'נשאר במחסן'),   # didn't fit this trip
+    ]
+
+    stop            = models.ForeignKey('Stop', on_delete=models.CASCADE,
+                        related_name='packages')
+    # Identity (from the manifest)
+    product_name    = models.CharField(max_length=200, blank=True)
+    product_code    = models.CharField(max_length=60, blank=True)   # 71:… / 91:…
+    tmsh_number     = models.CharField(max_length=60, blank=True)   # מס' תמ"ש
+    barcode         = models.CharField(max_length=80, blank=True)
+    # Quantities
+    quantity_pallets = models.PositiveIntegerField(default=0)       # כמות משטחים
+    quantity_units   = models.PositiveIntegerField(default=0)
+    weight_kg        = models.DecimalField(max_digits=8, decimal_places=2,
+                        null=True, blank=True)
+    # Paperwork
+    invoice_number  = models.CharField(max_length=50, blank=True)
+    checker_name    = models.CharField(max_length=100, blank=True)  # בודק
+    returns         = models.CharField(max_length=200, blank=True)  # החזרות
+    # State — load and deliver are independent flags
+    is_loaded       = models.BooleanField(default=False)
+    is_delivered    = models.BooleanField(default=False)
+    status          = models.CharField(max_length=12, choices=STATUS_CHOICES,
+                        default='pending')
+    loaded_at       = models.DateTimeField(null=True, blank=True)
+    delivered_at    = models.DateTimeField(null=True, blank=True)
+    notes           = models.TextField(blank=True)
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['stop__order', 'id']
+
+    def __str__(self):
+        return f"{self.product_name or self.product_code} → stop {self.stop_id}"
 
 
 class StopPhoto(models.Model):

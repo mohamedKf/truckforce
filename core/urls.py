@@ -62,6 +62,12 @@ urlpatterns = [
     path('stops/<int:pk>/delivery-note/', views.StopDeliveryNoteView.as_view()),
     path('drivers/locations-history/', views.DriverLocationsHistoryView.as_view()),
 
+    # ── Packages (package_delivery stops) ─────────────
+    path('stops/<int:stop_id>/packages/',        views.StopPackagesView.as_view()),
+    path('schedules/<int:schedule_id>/packages/', views.SchedulePackagesView.as_view()),
+    path('packages/leftovers/',                  views.LeftoverPackagesView.as_view()),
+    path('packages/<int:pk>/',                   views.PackageDetailView.as_view()),
+
     # ── Attendance — specific before <int:pk> ─────────
     path('attendance/',                   views.AttendanceListView.as_view()),
     path('attendance/clock-in/',          views.ClockInView.as_view()),
