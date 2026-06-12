@@ -62,6 +62,9 @@ urlpatterns = [
     path('stops/<int:pk>/delivery-note/', views.StopDeliveryNoteView.as_view()),
     path('drivers/locations-history/', views.DriverLocationsHistoryView.as_view()),
 
+    # ── Location link → coords ────────────────────────
+    path('parse-location/',                      views.ParseLocationLinkView.as_view()),
+
     # ── Packages (package_delivery stops) ─────────────
     path('stops/<int:stop_id>/packages/',        views.StopPackagesView.as_view()),
     path('schedules/<int:schedule_id>/packages/', views.SchedulePackagesView.as_view()),

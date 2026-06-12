@@ -29,6 +29,7 @@ from .models import (
 )
 from .serializers import AttendanceFixRequestSerializer
 from .serializers import PackageSerializer, DeliverySheetSerializer
+from . import location_url_parser
 from .serializers import (
     CompanySettingsSerializer,
     ManagerSerializer, ManagerLoginSerializer,
@@ -5165,3 +5166,25 @@ class LeftoverPackagesView(APIView):
             qs = qs.filter(stop__schedule__driver=driver)
         return Response(PackageSerializer(qs, many=True,
                         context={'request': request}).data)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Location-link → coordinates (Waze / Google / OSM / raw coords)
+# Driver pastes a link when self-creating a stop; the server parser
+# resolves it (following short-link redirects where needed).
+# ══════════════════════════════════════════════════════════════════
+class ParseLocationLinkView(APIView):
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request):
+        text = (request.data.get('link') or request.data.get('text') or '').strip()
+        if not text:
+            return Response({'error': 'No link provided'}, status=400)
+        try:
+            result = location_url_parser.parse(text)
+        except Exception:
+            result = None
+        if not result:
+            return Response({'found': False}, status=200)
+        lat, lng = result
+        return Response({'found': True, 'latitude': lat, 'longitude': lng})
