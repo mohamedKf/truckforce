@@ -7,6 +7,7 @@ from .models import (
     Accountant, PayrollSendLog,
     ChildOfDriver, PayrollConfig, Payslip,
     StopPhoto, AttendanceFixRequest, DeliveryConfirmation,
+    Package, DeliverySheet,
 )
 
 

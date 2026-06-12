@@ -305,7 +305,7 @@ class Stop(models.Model):
         help_text='If True, driver can reorder this stop. Set False for time-locked stops.')
 
     stop_type = models.CharField(
-        max_length=10,
+        max_length=20,
         choices=STOP_TYPE_CHOICES,
         default='delivery',
         help_text='סוג העצירה'
