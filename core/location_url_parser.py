@@ -67,7 +67,7 @@ LNG_MIN, LNG_MAX = -180.0, 180.0
 # Public API
 # ──────────────────────────────────────────────────────────────────────────
 
-def parse(text: str, expand_short: bool = True) -> Optional[Tuple[float, float]]:
+def parse(text: str, expand_short: bool = True, geocode=None) -> Optional[Tuple[float, float]]:
     """
     Parse `text` (URL or coords) into a (lat, lng) tuple.
 
@@ -97,12 +97,24 @@ def parse(text: str, expand_short: bool = True) -> Optional[Tuple[float, float]]
         if result is not None:
             return result
 
+    # Place-share links (Google "Share" button) carry only a NAME + place-id,
+    # never coordinates. If a geocoder was supplied, resolve the name to coords.
+    if geocode is not None:
+        name = extract_place_name(s)
+        if name:
+            try:
+                gr = geocode(name)
+            except Exception:
+                gr = None
+            if gr is not None:
+                return gr
+
     # Last resort: short URLs need a network round-trip to expand.
     if expand_short and _is_short_url(s):
         expanded = _expand_short_url(s)
         if expanded and expanded != s:
             # Recurse once with expansion off so a chain of shorts can't loop
-            return parse(expanded, expand_short=False)
+            return parse(expanded, expand_short=False, geocode=geocode)
 
     return None
 
@@ -147,6 +159,27 @@ _OSM_MLON_RE = re.compile(rf'[?&]mlon={_COORD}', re.IGNORECASE)
 
 # Bing ?cp=lat~lng
 _BING_CP_RE = re.compile(rf'[?&]cp={_COORD}~{_COORD}', re.IGNORECASE)
+
+# Google "/maps/place/<NAME>/..." — the app's Share-button links carry only a
+# place NAME (+ an internal place-id), no coordinates. We pull the name out so
+# a geocoder can turn it into lat/lng.
+_PLACE_RE = re.compile(r'/maps/place/([^/@?]+)', re.IGNORECASE)
+
+
+def extract_place_name(text):
+    """Pull a human place name out of a Google '/maps/place/<NAME>/' URL.
+    Returns the decoded name (e.g. 'The Greek Orthodox Church ...') or None."""
+    if not text:
+        return None
+    m = _PLACE_RE.search(text)
+    if not m:
+        return None
+    import urllib.parse
+    name = urllib.parse.unquote_plus(m.group(1)).replace('+', ' ').strip()
+    # Guard: don't treat a coordinate-looking segment as a place name.
+    if re.match(r'^-?\d+\.\d+\s*,', name):
+        return None
+    return name or None
 
 
 def _coerce(lat_str: str, lng_str: str) -> Optional[Tuple[float, float]]:

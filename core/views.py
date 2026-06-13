@@ -5626,8 +5626,48 @@ class ParseLocationLinkView(APIView):
         text = (request.data.get('link') or request.data.get('text') or '').strip()
         if not text:
             return Response({'error': 'No link provided'}, status=400)
+
+        from django.conf import settings as _dj
+        _gkey = getattr(_dj, 'GOOGLE_GEOCODING_KEY', '') or ''
+        _mtok = getattr(_dj, 'MAPBOX_TOKEN', '') or ''
+
+        def _geocode(name):
+            """Place name -> (lat, lng). Google first (best match for a name
+            that CAME from Google Maps), Mapbox as fallback. None if neither."""
+            if not name:
+                return None
+            import requests as _rq
+            if _gkey:
+                try:
+                    r = _rq.get('https://maps.googleapis.com/maps/api/geocode/json',
+                                params={'address': name, 'key': _gkey, 'region': 'il'},
+                                timeout=10)
+                    if r.status_code == 200:
+                        res = r.json().get('results') or []
+                        if res:
+                            loc = res[0]['geometry']['location']
+                            return (float(loc['lat']), float(loc['lng']))
+                except Exception:
+                    pass
+            if _mtok:
+                try:
+                    import urllib.parse as _up
+                    q = _up.quote(name)
+                    r = _rq.get(
+                        f'https://api.mapbox.com/geocoding/v5/mapbox.places/{q}.json',
+                        params={'access_token': _mtok, 'country': 'il', 'limit': 1},
+                        timeout=10)
+                    if r.status_code == 200:
+                        feats = r.json().get('features') or []
+                        if feats:
+                            c = feats[0]['center']  # [lng, lat]
+                            return (float(c[1]), float(c[0]))
+                except Exception:
+                    pass
+            return None
+
         try:
-            result = location_url_parser.parse(text)
+            result = location_url_parser.parse(text, geocode=_geocode)
         except Exception:
             result = None
         if not result:
