@@ -59,6 +59,9 @@ urlpatterns = [
     path('stops/<int:pk>/eta-distance/',  views.StopETADistanceView.as_view()),
     path('stop-photos/<int:pk>/',         views.StopPhotoDeleteView.as_view()),
     path('stop-tasks/<int:pk>/',          views.StopTaskDeleteView.as_view()),
+    path('stops/<int:pk>/documents/',        views.StopDocumentListCreateView.as_view()),
+    path('stop-documents/<int:pk>/sign/',    views.StopDocumentSignView.as_view()),
+    path('stop-documents/<int:pk>/',         views.StopDocumentDeleteView.as_view()),
     path('stops/<int:pk>/delivery-note/', views.StopDeliveryNoteView.as_view()),
     path('drivers/locations-history/', views.DriverLocationsHistoryView.as_view()),
 
@@ -132,6 +135,7 @@ urlpatterns = [
     path('track/<str:token>/data/',          views.tracking_data),
     path('track/<str:token>/eta/',           views.RouteETAView.as_view()),
     path('track/<str:token>/client-note/',   views.ClientNoteView.as_view()),
+    path('track/<str:token>/share-location/', views.ShareLocationView.as_view()),
 
     # ── Desktop auto-updater ──────────────────────────
     path('version/',                      views.app_version),

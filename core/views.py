@@ -25,7 +25,7 @@ from .models import (
     CompanySettings, Manager, Driver, Truck,
     DailySchedule, Stop, Attendance, CraneSession,
     Payroll, NotificationLog, Document,
-    TrackingLink, StopTask, Package, DeliverySheet,
+    TrackingLink, StopTask, Package, DeliverySheet, StopDocument,
 )
 from .serializers import AttendanceFixRequestSerializer
 from .serializers import PackageSerializer, DeliverySheetSerializer
@@ -36,7 +36,7 @@ from .serializers import (
     DriverSerializer, DriverListSerializer, DriverLoginSerializer,
     TruckSerializer, TruckListSerializer,
     DailyScheduleSerializer, DailyScheduleCreateSerializer,
-    StopSerializer, StopUpdateSerializer, StopPhotoSerializer,
+    StopSerializer, StopUpdateSerializer, StopPhotoSerializer, StopDocumentSerializer,
     AttendanceSerializer, ClockInSerializer, ClockOutSerializer,
     CraneSessionSerializer, CraneStartSerializer, CraneEndSerializer,
     PayrollSerializer, PayrollSummarySerializer,
@@ -2077,6 +2077,138 @@ class PayslipGenerateView(APIView):
 # STOP PHOTOS (unlimited proof-of-delivery photos per stop)
 # ──────────────────────────────────────────────
 
+class StopDocumentListCreateView(APIView):
+    """GET the documents on a stop; POST to add one (optionally with a file).
+    Manager or driver; driver limited to their own schedule."""
+    permission_classes = [IsManagerOrDriver]
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def _allowed(self, request, stop):
+        if hasattr(request, 'driver') and request.driver is not None:
+            return stop.schedule.driver_id == request.driver.id
+        return True
+
+    def get(self, request, pk):
+        try:
+            stop = Stop.objects.get(pk=pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if not self._allowed(request, stop):
+            return Response({'error': 'Forbidden'}, status=403)
+        return Response(StopDocumentSerializer(
+            stop.documents.all(), many=True, context={'request': request}).data)
+
+    def post(self, request, pk):
+        try:
+            stop = Stop.objects.get(pk=pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if not self._allowed(request, stop):
+            return Response({'error': 'Forbidden'}, status=403)
+
+        title = (request.data.get('title') or '').strip()
+        if not title:
+            return Response({'error': 'title required'}, status=400)
+
+        doc = StopDocument(
+            stop=stop,
+            title=title,
+            signer_name=(request.data.get('signer_name') or '').strip(),
+            order=int(request.data.get('order') or 0),
+        )
+
+        upload = request.FILES.get('file')
+        if upload:
+            try:
+                import cloudinary.uploader
+                result = cloudinary.uploader.upload(
+                    upload, resource_type='auto', folder='stop_documents',
+                    use_filename=True, unique_filename=True,
+                )
+            except Exception as e:
+                import traceback
+                print(f"[STOP-DOC] ERROR upload:\n{traceback.format_exc()}", flush=True)
+                return Response({'error': f'Upload failed: {e}'}, status=500)
+            secure_url = result.get('secure_url') or result.get('url')
+            if secure_url:
+                doc.file = secure_url
+
+        try:
+            doc.save()
+        except Exception as e:
+            import traceback
+            print(f"[STOP-DOC] ERROR save:\n{traceback.format_exc()}", flush=True)
+            return Response({'error': f'Save failed: {e}'}, status=500)
+
+        return Response(StopDocumentSerializer(
+            doc, context={'request': request}).data, status=201)
+
+
+class StopDocumentSignView(APIView):
+    """POST a signature for one document: signer_name + signature image."""
+    permission_classes = [IsManagerOrDriver]
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def post(self, request, pk):
+        try:
+            doc = StopDocument.objects.select_related(
+                'stop', 'stop__schedule').get(pk=pk)
+        except StopDocument.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if hasattr(request, 'driver') and request.driver is not None:
+            if doc.stop.schedule.driver_id != request.driver.id:
+                return Response({'error': 'Forbidden'}, status=403)
+
+        sig = request.FILES.get('signature') or request.FILES.get('signature_image')
+        if not sig:
+            return Response({'error': 'signature image required'}, status=400)
+        try:
+            import cloudinary.uploader
+            result = cloudinary.uploader.upload(
+                sig, resource_type='image', folder='stop_doc_signatures',
+                use_filename=True, unique_filename=True,
+            )
+        except Exception as e:
+            import traceback
+            print(f"[STOP-DOC] ERROR signature upload:\n{traceback.format_exc()}", flush=True)
+            return Response({'error': f'Upload failed: {e}'}, status=500)
+        secure_url = result.get('secure_url') or result.get('url')
+        if not secure_url:
+            return Response({'error': 'Upload returned no URL'}, status=500)
+
+        signer = (request.data.get('signer_name') or '').strip()
+        if signer:
+            doc.signer_name = signer
+        doc.signature_image = secure_url
+        doc.signed_at = timezone.now()
+        try:
+            doc.save()
+        except Exception as e:
+            import traceback
+            print(f"[STOP-DOC] ERROR save:\n{traceback.format_exc()}", flush=True)
+            return Response({'error': f'Save failed: {e}'}, status=500)
+
+        return Response(StopDocumentSerializer(
+            doc, context={'request': request}).data)
+
+
+class StopDocumentDeleteView(APIView):
+    """DELETE a stop document. Driver limited to their own schedule."""
+    permission_classes = [IsManagerOrDriver]
+
+    def delete(self, request, pk):
+        try:
+            doc = StopDocument.objects.select_related(
+                'stop', 'stop__schedule').get(pk=pk)
+        except StopDocument.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if hasattr(request, 'driver') and request.driver is not None:
+            if doc.stop.schedule.driver_id != request.driver.id:
+                return Response({'error': 'Forbidden'}, status=403)
+        doc.delete()
+        return Response(status=204)
+
+
 class StopPhotoListCreateView(APIView):
     """GET photos for a stop, POST to upload a new photo. Both manager and driver allowed."""
     permission_classes = [IsManagerOrDriver]
@@ -3282,6 +3414,16 @@ body{{background:#0A0A0A;color:#fff;font-family:-apple-system,BlinkMacSystemFont
   <div id="proof-grid"></div>
 </div>
 
+<div id="loc-section" style="background:#0D0D0D;padding:16px;border-top:1px solid #1A1A1A;">
+  <div style="font-size:14px;font-weight:700;color:#F5A623;margin-bottom:6px;">📍 שתף את המיקום המדויק שלך</div>
+  <p style="font-size:12px;color:#888;margin-bottom:12px;">הנהג בדרך אליך — שתף את מיקומך כדי שיגיע בדיוק לנקודה.</p>
+  <button class="send-btn" id="loc-btn" style="margin-top:0;" onclick="shareLocation()">📍 שלח את המיקום שלי</button>
+  <div style="text-align:center;color:#444;font-size:12px;margin:10px 0;">— או —</div>
+  <input class="phone-input" id="loc-link" type="text" style="margin-top:0;" placeholder="הדבק קישור Waze / Google Maps">
+  <button class="send-btn" id="loc-link-btn" style="background:#1A1A1A;color:#F5A623;border:1px solid #2A2A2A;" onclick="shareLocationLink()">שלח קישור</button>
+  <div id="loc-success" style="display:none;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);border-radius:10px;padding:14px;text-align:center;color:#22C55E;font-weight:700;margin-top:12px;">✓ המיקום נשלח לנהג!</div>
+</div>
+
 <div id="notes-section">
   <div id="notes-title">📝 השאר הערות לנהג</div>
   <textarea class="note-input" id="note-text" rows="3" placeholder="לדוגמה: אזור פריקה בכניסה הצדדית, קוד שער 1234..."></textarea>
@@ -3476,6 +3618,43 @@ function previewPhoto(input) {{
   reader.readAsDataURL(file);
 }}
 
+function shareLocation() {{
+  var btn = document.getElementById('loc-btn');
+  if (!navigator.geolocation) {{ alert('המכשיר לא תומך בשיתוף מיקום'); return; }}
+  btn.disabled = true; btn.textContent = '...מאתר מיקום';
+  navigator.geolocation.getCurrentPosition(function(pos) {{
+    postLocation({{ lat: pos.coords.latitude, lng: pos.coords.longitude }});
+  }}, function(err) {{
+    btn.disabled = false; btn.textContent = '📍 שלח את המיקום שלי';
+    alert('לא ניתן לקרוא מיקום. אפשר להדביק קישור במקום.');
+  }}, {{ enableHighAccuracy: true, timeout: 10000 }});
+}}
+function shareLocationLink() {{
+  var link = document.getElementById('loc-link').value.trim();
+  if (!link) return;
+  postLocation({{ link: link }});
+}}
+function postLocation(payload) {{
+  payload.stop_id = STOP_ID;
+  fetch(SITE + '/api/track/' + TOKEN + '/share-location/', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(payload)
+  }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    var b = document.getElementById('loc-btn');
+    if (data && data.ok) {{
+      document.getElementById('loc-success').style.display = 'block';
+      b.disabled = true; b.textContent = '✓ נשלח';
+    }} else {{
+      b.disabled = false; b.textContent = '📍 שלח את המיקום שלי';
+      alert((data && data.error) ? data.error : 'שגיאה, נסה שוב');
+    }}
+  }}).catch(function() {{
+    var b = document.getElementById('loc-btn');
+    b.disabled = false; b.textContent = '📍 שלח את המיקום שלי';
+    alert('שגיאת רשת');
+  }});
+}}
 async function sendNote() {{
   const note  = document.getElementById('note-text').value.trim();
   const phone = document.getElementById('phone-input').value.trim();
@@ -4136,6 +4315,70 @@ class StopTaskDeleteView(APIView):
 
     def delete(self, request, pk):
         StopTask.objects.filter(pk=pk).delete()
+        return Response({'ok': True})
+
+
+class ShareLocationView(APIView):
+    """
+    POST /api/track/<token>/share-location/
+    Public — client shares exact GPS (browser) or pastes a Waze/Google
+    link via the tracking page. Updates the target stop's coordinates
+    and pings the driver to recalculate. No auth required.
+    """
+    permission_classes = []
+
+    def post(self, request, token):
+        try:
+            link = TrackingLink.objects.select_related(
+                'driver', 'target_stop').get(token=token)
+        except TrackingLink.DoesNotExist:
+            return Response({'ok': False, 'error': 'Link not found'}, status=404)
+        if not link.is_valid():
+            return Response({'ok': False, 'error': 'Link expired'}, status=410)
+
+        stop = link.target_stop
+        if stop is None:
+            sid = request.data.get('stop_id')
+            stop = Stop.objects.filter(pk=sid).first() if sid else None
+        if stop is None:
+            return Response({'ok': False, 'error': 'No stop to update'}, status=400)
+
+        lat, lng = request.data.get('lat'), request.data.get('lng')
+        if lat is None or lng is None:
+            raw = (request.data.get('link') or '').strip()
+            if raw:
+                try:
+                    parsed = location_url_parser.parse(raw)
+                except Exception:
+                    parsed = None
+                if parsed:
+                    lat, lng = parsed
+        try:
+            lat, lng = float(lat), float(lng)
+        except (TypeError, ValueError):
+            return Response({'ok': False, 'error': 'No valid location'}, status=400)
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return Response({'ok': False, 'error': 'Location out of range'}, status=400)
+
+        stop.latitude, stop.longitude = lat, lng
+        stop.save(update_fields=['latitude', 'longitude'])
+
+        # Tell the driver the destination moved (same feed as client notes).
+        try:
+            StopTask.objects.create(
+                stop=stop, source='client',
+                note='📍 הלקוח עדכן את מיקום היעד — מומלץ לחשב מסלול מחדש')
+        except Exception:
+            pass
+        try:
+            from . import firebase
+            sched = getattr(stop, 'schedule', None)
+            if sched is not None:
+                firebase.notify_driver_schedule_updated(
+                    link.driver, sched, 'מיקום יעד עודכן על ידי הלקוח')
+        except Exception:
+            pass
+
         return Response({'ok': True})
 
 

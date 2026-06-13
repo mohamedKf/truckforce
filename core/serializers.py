@@ -7,7 +7,7 @@ from .models import (
     Accountant, PayrollSendLog,
     ChildOfDriver, PayrollConfig, Payslip,
     StopPhoto, AttendanceFixRequest, DeliveryConfirmation,
-    Package, DeliverySheet,
+    Package, DeliverySheet, StopDocument,
 )
 
 
@@ -253,6 +253,28 @@ class StopPhotoSerializer(serializers.ModelSerializer):
         return _abs_url(obj.image, self.context.get('request'))
 
 
+class StopDocumentSerializer(serializers.ModelSerializer):
+    file_url      = serializers.SerializerMethodField()
+    signature_url = serializers.SerializerMethodField()
+    signed        = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = StopDocument
+        fields = ['id', 'stop', 'title', 'signer_name',
+                  'file_url', 'signature_url',
+                  'signed', 'signed_at', 'order', 'created_at']
+        read_only_fields = ['signed_at', 'created_at']
+
+    def get_file_url(self, obj):
+        return _abs_url(obj.file, self.context.get('request'))
+
+    def get_signature_url(self, obj):
+        return _abs_url(obj.signature_image, self.context.get('request'))
+
+    def get_signed(self, obj):
+        return obj.signed_at is not None
+
+
 class PackageSerializer(serializers.ModelSerializer):
     invoice_file_url = serializers.SerializerMethodField()
 
@@ -303,6 +325,7 @@ class StopSerializer(serializers.ModelSerializer):
         return _abs_url(obj.delivery_note_pdf, self.context.get('request'))
 
     packages          = PackageSerializer(many=True, read_only=True)
+    documents         = StopDocumentSerializer(many=True, read_only=True)
     invoice_file_url  = serializers.SerializerMethodField()
 
     def get_invoice_file_url(self, obj):
@@ -331,6 +354,7 @@ class StopSerializer(serializers.ModelSerializer):
             'contact_name', 'contact_phone', 'contact_email',
             'invoice_number', 'invoice_file_url', 'invoice_signed',
             'packages',
+            'documents',
             'pickup_stop',
             'driver_note',
             'delivery_note_url',

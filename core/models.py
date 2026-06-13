@@ -501,6 +501,47 @@ class DeliveryConfirmation(models.Model):
     def __str__(self):
         return f"Confirmation for stop #{self.stop_id} – {self.signed_by_name}"
 
+# ──────────────────────────────
+# STOP DOCUMENTS (multiple signable docs per stop)
+# ──────────────────────────────
+
+class StopDocument(models.Model):
+    """One signable document/paper attached to a stop.
+
+    A stop can carry several of these — a delivery note, a return slip,
+    an invoice acknowledgment — each with its own file and its own
+    signature. Generalizes the single per-stop DeliveryConfirmation; that
+    older flow is kept alive for current app builds during rollout.
+    """
+    stop            = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name='documents')
+    title           = models.CharField(max_length=200, help_text='What this document is, e.g. "תעודת משלוח"')
+    signer_name     = models.CharField(max_length=200, blank=True, help_text='Name of the person who signs')
+    file            = models.FileField(upload_to='stop_documents/',
+                                       storage=RawMediaCloudinaryStorage(),
+                                       blank=True, null=True,
+                                       max_length=500,  # long Cloudinary URLs
+                                       help_text='The document file (PDF or image of the paper)')
+    signature_image = models.ImageField(upload_to='stop_doc_signatures/',
+                                        blank=True, null=True,
+                                        max_length=500,  # long Cloudinary URLs
+                                        help_text='PNG of the hand-drawn signature, once signed')
+    signed_at       = models.DateTimeField(null=True, blank=True,
+                                           help_text='Set when signed; empty = unsigned')
+    order           = models.PositiveIntegerField(default=0)
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'created_at']
+
+    @property
+    def signed(self):
+        return self.signed_at is not None
+
+    def __str__(self):
+        state = 'signed' if self.signed else 'unsigned'
+        return f"Doc '{self.title}' for stop #{self.stop_id} ({state})"
+
+
 # ──────────────────────────────────────────────
 # ATTENDANCE (CLOCK IN / OUT)
 # ──────────────────────────────────────────────
