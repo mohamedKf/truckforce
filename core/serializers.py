@@ -380,6 +380,13 @@ class DailyScheduleSerializer(serializers.ModelSerializer):
     truck_plate         = serializers.CharField(source='truck.plate_number', read_only=True)
     missed_stops_count  = serializers.IntegerField(read_only=True)
     completion_percent  = serializers.IntegerField(read_only=True)
+    delivery_sheet      = serializers.SerializerMethodField()
+
+    def get_delivery_sheet(self, obj):
+        sheet = getattr(obj, 'delivery_sheet', None)
+        if not sheet:
+            return None
+        return DeliverySheetSerializer(sheet, context=self.context).data
 
     class Meta:
         model  = DailySchedule
@@ -387,7 +394,7 @@ class DailyScheduleSerializer(serializers.ModelSerializer):
             'id', 'driver', 'driver_name', 'truck', 'truck_plate',
             'date', 'status', 'manager_notes', 'created_by',
             'missed_stops_count', 'completion_percent',
-            'stops', 'created_at',
+            'stops', 'created_at', 'delivery_sheet',
             # ── Route optimization ──
             'route_optimized', 'route_optimized_at', 'route_suggestion',
             'driver_notified',
