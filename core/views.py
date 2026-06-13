@@ -2820,6 +2820,209 @@ def _send_confirmation_email(confirmation):
         return False
 
 
+class DeliverySheetView(APIView):
+    """The assignment-level delivery sheet — ONE shared PDF per schedule that
+    every client signs. The manager OR the schedule's own driver may upload it.
+
+    GET    -> current sheet (original + running signed copy + signature_count)
+    POST   -> upload/replace the blank ORIGINAL pdf (resets the signing run)
+    DELETE -> remove the sheet entirely
+    """
+    permission_classes = [IsManagerOrDriver]
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def _get_schedule(self, request, pk):
+        try:
+            sched = DailySchedule.objects.get(pk=pk)
+        except DailySchedule.DoesNotExist:
+            return None, Response({'error': 'Schedule not found'}, status=404)
+        if hasattr(request, 'driver') and request.driver is not None:
+            if sched.driver_id != request.driver.id:
+                return None, Response({'error': 'Forbidden'}, status=403)
+        return sched, None
+
+    def get(self, request, pk):
+        sched, err = self._get_schedule(request, pk)
+        if err:
+            return err
+        sheet = getattr(sched, 'delivery_sheet', None)
+        if not sheet:
+            return Response({'error': 'No delivery sheet'}, status=404)
+        return Response(DeliverySheetSerializer(
+            sheet, context={'request': request}).data)
+
+    def post(self, request, pk):
+        sched, err = self._get_schedule(request, pk)
+        if err:
+            return err
+        f = request.FILES.get('file')
+        if not f:
+            return Response({'error': 'file required'}, status=400)
+        try:
+            import cloudinary.uploader
+            # Deterministic public_id => exactly one original asset per schedule.
+            result = cloudinary.uploader.upload(
+                f, resource_type='raw', folder='delivery_sheets',
+                public_id=f'delivery_sheet_orig_{sched.id}',
+                use_filename=False, unique_filename=False, overwrite=True,
+            )
+        except Exception as e:
+            print(f"[DELIVERY-SHEET] upload failed: {e}", flush=True)
+            return Response({'error': f'Upload failed: {e}'}, status=500)
+        secure_url = result.get('secure_url') or result.get('url')
+        if not secure_url:
+            return Response({'error': 'Upload returned no URL'}, status=500)
+
+        sheet, _created = DeliverySheet.objects.get_or_create(schedule=sched)
+        # A fresh blank original starts a fresh signing run.
+        sheet.original_pdf    = secure_url
+        sheet.signed_pdf      = None
+        sheet.signature_count = 0
+        sheet.save()
+        try:
+            publish_event('schedules_changed',
+                          by_user_id=getattr(getattr(request, 'driver', None), 'id', None))
+        except Exception:
+            pass
+        return Response(DeliverySheetSerializer(
+            sheet, context={'request': request}).data, status=201)
+
+    def delete(self, request, pk):
+        sched, err = self._get_schedule(request, pk)
+        if err:
+            return err
+        sheet = getattr(sched, 'delivery_sheet', None)
+        if sheet:
+            for fld in ('original_pdf', 'signed_pdf'):
+                old = getattr(sheet, fld)
+                if old:
+                    try:
+                        old.delete(save=False)
+                    except Exception:
+                        pass
+            sheet.delete()
+        return Response(status=204)
+
+
+class DeliverySheetSignView(APIView):
+    """A client signs the shared assignment PDF.
+
+    Stamp the signature onto the LATEST version (running signed copy if present,
+    else the blank original), upload over the same Cloudinary asset, and REPLACE
+    signed_pdf — bumping signature_count. blank -> client 1 signs -> that is the
+    live copy -> client 2 signs THAT -> replaces again, and so on. Reuses the
+    same stamper as the per-stop delivery-note signing.
+    """
+    permission_classes = [IsManagerOrDriver]
+    parser_classes     = [MultiPartParser, FormParser]
+
+    def post(self, request, pk):
+        try:
+            sched = DailySchedule.objects.get(pk=pk)
+        except DailySchedule.DoesNotExist:
+            return Response({'error': 'Schedule not found'}, status=404)
+        if hasattr(request, 'driver') and request.driver is not None:
+            if sched.driver_id != request.driver.id:
+                return Response({'error': 'Forbidden'}, status=403)
+
+        sheet = getattr(sched, 'delivery_sheet', None)
+        if not sheet or not sheet.original_pdf:
+            return Response({'error': 'No delivery sheet to sign'}, status=400)
+
+        signature_file = request.FILES.get('signature')
+        if not signature_file:
+            return Response({'error': 'signature image required'}, status=400)
+        try:
+            signature_file.seek(0)
+            sig_bytes = signature_file.read()
+        except Exception:
+            sig_bytes = b''
+        if not sig_bytes:
+            return Response({'error': 'empty signature'}, status=400)
+
+        def _f(key, default):
+            try:
+                return float(request.data.get(key, default))
+            except (TypeError, ValueError):
+                return default
+        try:
+            sig_page = int(float(request.data.get('sig_page', 0)))
+        except (TypeError, ValueError):
+            sig_page = 0
+        sig_x = _f('sig_x', 0.55)
+        sig_y = _f('sig_y', 0.82)
+        sig_w = _f('sig_w', 0.30)
+        sig_h = _f('sig_h', 0.10)
+
+        def _url_of(field):
+            try:
+                if not field:
+                    return ''
+                nm = str(getattr(field, 'name', '') or '')
+                return nm if nm.startswith('http') else field.url
+            except Exception:
+                return ''
+        latest_url = _url_of(sheet.signed_pdf) or _url_of(sheet.original_pdf)
+        if not latest_url:
+            return Response({'error': 'sheet file missing'}, status=400)
+
+        try:
+            import requests as _rq
+            from .delivery_stamp import stamp_signature_on_note
+            resp = _rq.get(latest_url, timeout=30)
+            if resp.status_code != 200 or not resp.content:
+                return Response({'error': 'could not fetch current sheet'},
+                                status=502)
+            stamped = stamp_signature_on_note(
+                resp.content, sig_bytes,
+                page=sig_page, nx=sig_x, ny=sig_y, nw=sig_w, nh=sig_h,
+            )
+        except Exception as e:
+            print(f"[SHEET-SIGN] stamp error: {e}", flush=True)
+            return Response({'error': f'stamp failed: {e}'}, status=500)
+        if not stamped:
+            return Response({'error': 'stamp produced no output'}, status=500)
+
+        def _upload_pdf_bytes(data, public_id):
+            import os as _os, tempfile as _tempfile
+            try:
+                import cloudinary.uploader
+                tmp = _tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                try:
+                    tmp.write(data)
+                    tmp.close()
+                    res = cloudinary.uploader.upload(
+                        tmp.name, resource_type='raw', folder='delivery_sheets',
+                        public_id=public_id, use_filename=False,
+                        unique_filename=False, overwrite=True,
+                    )
+                finally:
+                    try:
+                        _os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                return res.get('secure_url') or res.get('url')
+            except Exception as e:
+                print(f"[SHEET-SIGN] upload failed: {e}", flush=True)
+                return None
+
+        secure_url = _upload_pdf_bytes(stamped, f'delivery_sheet_signed_{sched.id}')
+        if not secure_url:
+            return Response({'error': 'upload failed'}, status=500)
+
+        sheet.signed_pdf      = secure_url
+        sheet.signature_count = (sheet.signature_count or 0) + 1
+        sheet.save(update_fields=['signed_pdf', 'signature_count', 'updated_at'])
+        try:
+            publish_event('schedules_changed',
+                          by_user_id=getattr(getattr(request, 'driver', None), 'id', None))
+        except Exception:
+            pass
+
+        return Response(DeliverySheetSerializer(
+            sheet, context={'request': request}).data)
+
+
 class StopSignatureView(APIView):
     """
     POST: Driver submits the signature PNG plus its position, and we stamp it

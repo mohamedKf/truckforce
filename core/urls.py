@@ -62,6 +62,8 @@ urlpatterns = [
     path('stops/<int:pk>/documents/',        views.StopDocumentListCreateView.as_view()),
     path('stop-documents/<int:pk>/sign/',    views.StopDocumentSignView.as_view()),
     path('stop-documents/<int:pk>/',         views.StopDocumentDeleteView.as_view()),
+    path('schedules/<int:pk>/delivery-sheet/',      views.DeliverySheetView.as_view()),
+    path('schedules/<int:pk>/delivery-sheet/sign/', views.DeliverySheetSignView.as_view()),
     path('stops/<int:pk>/delivery-note/', views.StopDeliveryNoteView.as_view()),
     path('drivers/locations-history/', views.DriverLocationsHistoryView.as_view()),
 
