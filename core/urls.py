@@ -69,6 +69,9 @@ urlpatterns = [
 
     # ── Location link → coords ────────────────────────
     path('parse-location/',                      views.ParseLocationLinkView.as_view()),
+    path('places/autocomplete/',                 views.PlacesAutocompleteView.as_view()),
+    path('places/details/',                      views.PlaceDetailsView.as_view()),
+    path('places/resolve/',                      views.PlaceResolveView.as_view()),
 
     # ── Packages (package_delivery stops) ─────────────
     path('stops/<int:stop_id>/packages/',        views.StopPackagesView.as_view()),

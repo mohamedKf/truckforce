@@ -124,6 +124,14 @@ MAPBOX_TOKEN = config('MAPBOX_TOKEN', default='')
 # and later by the AI delivery-sheet reader to resolve addresses → coords.
 GOOGLE_GEOCODING_KEY = config('GOOGLE_GEOCODING_KEY', default='')
 
+# Google Places: Autocomplete + Find-Place-From-Text + Place Details.
+# Used by the desktop assignment search bar (text → exact place → Google
+# Maps link) and by the driver app's address search. If left unset, the
+# Places endpoints fall back to GOOGLE_GEOCODING_KEY (_places_key() in
+# views.py). The key MUST have the Places API enabled in Google Cloud with
+# billing on, otherwise Places calls return REQUEST_DENIED.
+GOOGLE_PLACES_KEY = config('GOOGLE_PLACES_KEY', default='')
+
 # SITE_URL: absolute base URL of this Django deployment. Used by
 # tracking_page (HTML) to build links the client can share. Falls back to
 # whatever request.build_absolute_uri returns if unset.

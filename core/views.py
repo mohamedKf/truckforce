@@ -5674,3 +5674,169 @@ class ParseLocationLinkView(APIView):
             return Response({'found': False}, status=200)
         lat, lng = result
         return Response({'found': True, 'latitude': lat, 'longitude': lng})
+
+# ══════════════════════════════════════════════════════════════════
+# Google Places — Autocomplete + Details (server-proxied)
+# The API key never leaves the backend. Used by the desktop assignments
+# page and the driver app to search an address/POI by typing and pick
+# from suggestions. Place IDs from autocomplete are resolved to coords
+# by the details endpoint.
+# ══════════════════════════════════════════════════════════════════
+def _places_key():
+    """Prefer a dedicated Places key; fall back to the geocoding key."""
+    from django.conf import settings as _dj
+    return (getattr(_dj, 'GOOGLE_PLACES_KEY', '') or
+            getattr(_dj, 'GOOGLE_GEOCODING_KEY', '') or '')
+
+
+class PlacesAutocompleteView(APIView):
+    """POST {query, sessiontoken?, language?} ->
+            {predictions: [{description, place_id}]}
+    Type-ahead suggestions via Google Places Autocomplete, biased to Israel."""
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request):
+        query = (request.data.get('query') or request.data.get('input') or '').strip()
+        if len(query) < 2:
+            return Response({'predictions': []})
+        key = _places_key()
+        if not key:
+            return Response({'predictions': [], 'error': 'no_places_key'}, status=200)
+        token = request.data.get('sessiontoken') or ''
+        lang = request.data.get('language') or 'iw'   # Google uses 'iw' for Hebrew
+        import requests as _rq
+        try:
+            r = _rq.get(
+                'https://maps.googleapis.com/maps/api/place/autocomplete/json',
+                params={
+                    'input':        query,
+                    'key':          key,
+                    'language':     lang,
+                    'components':   'country:il',
+                    'sessiontoken': token,
+                },
+                timeout=10)
+            j = r.json()
+            status = j.get('status')
+            if status == 'REQUEST_DENIED':
+                # Almost always: Places API not enabled on the key, or the
+                # key is API-restricted to Geocoding only.
+                return Response({'predictions': [],
+                                 'error': 'request_denied',
+                                 'detail': j.get('error_message', '')}, status=200)
+            preds = [{'description': p.get('description', ''),
+                      'place_id':    p.get('place_id', '')}
+                     for p in (j.get('predictions') or [])]
+            return Response({'predictions': preds[:6]})
+        except Exception as e:
+            print(f"[PLACES] autocomplete failed: {e}", flush=True)
+            return Response({'predictions': [], 'error': 'exception'}, status=200)
+
+
+class PlaceDetailsView(APIView):
+    """POST {place_id, sessiontoken?} ->
+            {found, latitude, longitude, address}
+    Resolves an autocomplete prediction to coordinates."""
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request):
+        place_id = (request.data.get('place_id') or '').strip()
+        if not place_id:
+            return Response({'found': False}, status=200)
+        key = _places_key()
+        if not key:
+            return Response({'found': False, 'error': 'no_places_key'}, status=200)
+        token = request.data.get('sessiontoken') or ''
+        import requests as _rq
+        try:
+            r = _rq.get(
+                'https://maps.googleapis.com/maps/api/place/details/json',
+                params={
+                    'place_id':     place_id,
+                    'key':          key,
+                    'fields':       'geometry,formatted_address,name',
+                    'sessiontoken': token,
+                },
+                timeout=10)
+            j = r.json()
+            if j.get('status') != 'OK':
+                return Response({'found': False,
+                                 'error':  j.get('status', 'error'),
+                                 'detail': j.get('error_message', '')}, status=200)
+            res = j.get('result') or {}
+            loc = (res.get('geometry') or {}).get('location') or {}
+            if 'lat' not in loc or 'lng' not in loc:
+                return Response({'found': False}, status=200)
+            return Response({
+                'found':     True,
+                'latitude':  float(loc['lat']),
+                'longitude': float(loc['lng']),
+                'address':   res.get('formatted_address') or res.get('name') or '',
+            })
+        except Exception as e:
+            print(f"[PLACES] details failed: {e}", flush=True)
+            return Response({'found': False, 'error': 'exception'}, status=200)
+
+
+class PlaceResolveView(APIView):
+    """POST {query, language?} ->
+            {found, latitude, longitude, name, address, place_id, maps_link}
+    Resolves free text to the single best-matching place via Google Places
+    'Find Place From Text', and returns a ready-to-open Google Maps URL whose
+    query carries the coordinates (so the same link is also parseable by the
+    stop's location-link field)."""
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request):
+        query = (request.data.get('query') or request.data.get('text') or '').strip()
+        if len(query) < 2:
+            return Response({'found': False}, status=200)
+        key = _places_key()
+        if not key:
+            return Response({'found': False, 'error': 'no_places_key'}, status=200)
+        lang = request.data.get('language') or 'iw'
+        import requests as _rq
+        try:
+            r = _rq.get(
+                'https://maps.googleapis.com/maps/api/place/findplacefromtext/json',
+                params={
+                    'input':     query,
+                    'inputtype': 'textquery',
+                    'fields':    'geometry,name,formatted_address,place_id',
+                    'language':  lang,
+                    'key':       key,
+                },
+                timeout=10)
+            j = r.json()
+            if j.get('status') == 'REQUEST_DENIED':
+                return Response({'found': False, 'error': 'request_denied',
+                                 'detail': j.get('error_message', '')}, status=200)
+            cands = j.get('candidates') or []
+            if not cands:
+                return Response({'found': False}, status=200)
+            c = cands[0]
+            loc = (c.get('geometry') or {}).get('location') or {}
+            if 'lat' not in loc or 'lng' not in loc:
+                return Response({'found': False}, status=200)
+            lat = float(loc['lat'])
+            lng = float(loc['lng'])
+            place_id = c.get('place_id', '')
+            # query carries the coords (parseable by the stop link field);
+            # query_place_id makes Google open the exact place card.
+            import urllib.parse as _up
+            link = ('https://www.google.com/maps/search/?api=1'
+                    f'&query={lat},{lng}')
+            if place_id:
+                link += '&query_place_id=' + _up.quote(place_id)
+            return Response({
+                'found':     True,
+                'latitude':  lat,
+                'longitude': lng,
+                'name':      c.get('name', ''),
+                'address':   c.get('formatted_address', ''),
+                'place_id':  place_id,
+                'maps_link': link,
+            })
+        except Exception as e:
+            print(f"[PLACES] resolve failed: {e}", flush=True)
+            return Response({'found': False, 'error': 'exception'}, status=200)
