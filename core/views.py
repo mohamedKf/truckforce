@@ -1392,7 +1392,7 @@ class DriverLocationUpdateView(APIView):
     def post(self, request):
         driver = request.driver
 
-        # Auto-close any stale shift (>14h) so we don't keep recording
+        # Auto-close any stale shift (>17h) so we don't keep recording
         # locations against a forgotten shift. After this, the find-open-
         # shift query below correctly returns nothing for stale shifts.
         try:
@@ -2145,11 +2145,20 @@ class StopDocumentListCreateView(APIView):
 
 
 class StopDocumentSignView(APIView):
-    """POST a signature for one document: signer_name + signature image."""
+    """POST a signature for one document and stamp it onto the document file.
+
+    Accepts the signature PNG plus a normalized box position
+    (sig_page, sig_x, sig_y, sig_w, sig_h). The signature is burned onto the
+    actual file — PDF via the delivery-note stamper, image via PIL — so the
+    signed paper itself carries the signature (mirrors the delivery-note flow).
+    If position is omitted (older app build) a sensible default spot is used.
+    If stamping fails for any reason we still record the detached signature, so
+    signing never hard-fails."""
     permission_classes = [IsManagerOrDriver]
     parser_classes     = [MultiPartParser, FormParser]
 
     def post(self, request, pk):
+        import io, traceback
         try:
             doc = StopDocument.objects.select_related(
                 'stop', 'stop__schedule').get(pk=pk)
@@ -2163,33 +2172,94 @@ class StopDocumentSignView(APIView):
         if not sig:
             return Response({'error': 'signature image required'}, status=400)
         try:
-            import cloudinary.uploader
-            result = cloudinary.uploader.upload(
-                sig, resource_type='image', folder='stop_doc_signatures',
+            sig_bytes = sig.read()
+        except Exception:
+            sig_bytes = None
+        if not sig_bytes:
+            return Response({'error': 'signature image required'}, status=400)
+
+        import cloudinary.uploader
+        # Keep the raw signature PNG as a record (same as before).
+        try:
+            sig_res = cloudinary.uploader.upload(
+                io.BytesIO(sig_bytes), resource_type='image',
+                folder='stop_doc_signatures',
                 use_filename=True, unique_filename=True,
             )
-        except Exception as e:
-            import traceback
+            sig_url = sig_res.get('secure_url') or sig_res.get('url')
+        except Exception:
             print(f"[STOP-DOC] ERROR signature upload:\n{traceback.format_exc()}", flush=True)
-            return Response({'error': f'Upload failed: {e}'}, status=500)
-        secure_url = result.get('secure_url') or result.get('url')
-        if not secure_url:
+            return Response({'error': 'Signature upload failed'}, status=500)
+        if not sig_url:
             return Response({'error': 'Upload returned no URL'}, status=500)
+
+        # Signature box position on the document (normalized, top-left origin).
+        def _f(key, default):
+            try:
+                return float(request.data.get(key, default))
+            except (TypeError, ValueError):
+                return default
+        page = int(_f('sig_page', 0))
+        nx, ny = _f('sig_x', 0.55), _f('sig_y', 0.82)
+        nw, nh = _f('sig_w', 0.35), _f('sig_h', 0.10)
+
+        # Stamp the signature onto the actual document file.
+        signed_url = None
+        try:
+            import requests as _rq
+            src = str(doc.file) if doc.file else ''
+            if src.startswith('http'):
+                r = _rq.get(src, timeout=20)
+                if r.status_code == 200 and r.content:
+                    raw = r.content
+                    if raw[:5] == b'%PDF-':
+                        from delivery_stamp import stamp_signature_on_note
+                        signed = stamp_signature_on_note(
+                            raw, sig_bytes, page, nx, ny, nw, nh)
+                        up = cloudinary.uploader.upload(
+                            io.BytesIO(signed), resource_type='raw',
+                            folder='stop_documents_signed', format='pdf',
+                            use_filename=True, unique_filename=True,
+                        )
+                    else:
+                        from PIL import Image
+                        base = Image.open(io.BytesIO(raw)).convert('RGBA')
+                        W, H = base.size
+                        sgn = Image.open(io.BytesIO(sig_bytes)).convert('RGBA')
+                        bx = max(0, min(int(nx * W), W - 1))
+                        by = max(0, min(int(ny * H), H - 1))
+                        bw = max(1, min(int(nw * W), W - bx))
+                        bh = max(1, min(int(nh * H), H - by))
+                        sgn.thumbnail((bw, bh))
+                        base.alpha_composite(sgn, (bx, by))
+                        out = io.BytesIO()
+                        base.convert('RGB').save(out, format='JPEG', quality=90)
+                        up = cloudinary.uploader.upload(
+                            io.BytesIO(out.getvalue()), resource_type='image',
+                            folder='stop_documents_signed',
+                            use_filename=True, unique_filename=True,
+                        )
+                    signed_url = up.get('secure_url') or up.get('url')
+        except Exception:
+            print(f"[STOP-DOC] WARN stamp failed (keeping original):\n{traceback.format_exc()}", flush=True)
 
         signer = (request.data.get('signer_name') or '').strip()
         if signer:
             doc.signer_name = signer
-        doc.signature_image = secure_url
+        doc.signature_image = sig_url
+        if signed_url:
+            # The signed document supersedes the blank original.
+            doc.file = signed_url
         doc.signed_at = timezone.now()
         try:
             doc.save()
         except Exception as e:
-            import traceback
             print(f"[STOP-DOC] ERROR save:\n{traceback.format_exc()}", flush=True)
             return Response({'error': f'Save failed: {e}'}, status=500)
 
-        return Response(StopDocumentSerializer(
-            doc, context={'request': request}).data)
+        data = StopDocumentSerializer(doc, context={'request': request}).data
+        data['pdf_url'] = signed_url or data.get('file_url')
+        return Response(data)
 
 
 class StopDocumentDeleteView(APIView):

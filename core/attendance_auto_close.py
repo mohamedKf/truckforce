@@ -1,6 +1,6 @@
 """
 attendance_auto_close.py — Detects and closes shifts where a driver
-forgot to clock out (>14h since clock-in), creating a fix request
+forgot to clock out (>17h since clock-in), creating a fix request
 so the manager and driver can correct the actual end time.
 
 Two entry points:
@@ -22,7 +22,7 @@ from .firebase_sync import publish_event
 
 # How long after clock-in we consider a shift "forgotten".
 # No human should be on shift longer than this without clocking out.
-STALE_SHIFT_HOURS = 14
+STALE_SHIFT_HOURS = 17
 
 
 def _is_stale(att: Attendance, threshold_hours: int = STALE_SHIFT_HOURS) -> bool:
