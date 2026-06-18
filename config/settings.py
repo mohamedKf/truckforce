@@ -132,6 +132,10 @@ GOOGLE_GEOCODING_KEY = config('GOOGLE_GEOCODING_KEY', default='')
 # billing on, otherwise Places calls return REQUEST_DENIED.
 GOOGLE_PLACES_KEY = config('GOOGLE_PLACES_KEY', default='')
 
+
+OPENAI_API_KEY      = config('OPENAI_API_KEY', default='')
+OPENAI_VISION_MODEL = config('OPENAI_VISION_MODEL', default='gpt-4o')
+
 # SITE_URL: absolute base URL of this Django deployment. Used by
 # tracking_page (HTML) to build links the client can share. Falls back to
 # whatever request.build_absolute_uri returns if unset.

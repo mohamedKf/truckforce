@@ -53,3 +53,5 @@ python-bidi
 arabic-reshaper
 PyMuPDF
 qrcode
+openai>=1.30
+PyMuPDF>=1.24

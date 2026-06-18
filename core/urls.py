@@ -159,4 +159,7 @@ urlpatterns = [
     path('billing/scan-qr/',                 views.ScanQRView.as_view()),
     path('scan/<str:token>/',                views.scan_page_view),
     path('scan/<str:token>/upload/',         views.ScanUploadView.as_view()),
+
+    # ── AI delivery-sheet reader ──────────────────────────────────────
+    path('ai/parse-delivery-sheet/',         views.ParseDeliverySheetView.as_view()),
 ]
