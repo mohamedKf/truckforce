@@ -22,10 +22,10 @@ from django.conf import settings
 # What we ask the model to return. Kept strict so the desktop can map it
 # straight onto editable stop rows.
 _PROMPT = (
-    "You are a data-extraction assistant for a logistics company in Israel. "
-    "This document is one or more delivery route sheets — usually one route "
-    "sheet per driver. Read it and return ONLY a JSON object with EXACTLY "
-    "this shape:\n"
+    "You are a careful data-extraction assistant for a logistics company in "
+    "Israel. The image is a delivery route sheet (often photographed at an "
+    "angle or rotated, and partly handwritten). Read it as-is and return ONLY "
+    "a JSON object with EXACTLY this shape:\n"
     "{\n"
     '  "date": "YYYY-MM-DD or empty string",\n'
     '  "drivers": [\n'
@@ -38,19 +38,30 @@ _PROMPT = (
     "    }\n"
     "  ]\n"
     "}\n"
-    "Rules:\n"
-    "- Return ONE entry in \"drivers\" per route/driver. The driver name, ID and "
-    "route number are usually in the header of each sheet.\n"
-    "- Each table row is one delivery stop. Put the recipient/business name in "
-    "site_name, the contact person in contact_name, and the phone in contact_phone.\n"
-    "- Text is usually Hebrew; keep names and addresses in their original language.\n"
-    "- Capture location clues EXACTLY as written: street in address, city/town "
-    "in city. If only a name and city are given, leave address empty. NEVER "
-    "guess or fabricate a street address — the system resolves it afterwards.\n"
-    "- Use empty strings and 0 where a value is missing. NEVER invent data.\n"
-    "- package_count must be an integer (0 if unknown).\n"
-    "- Keep stops in the order they appear.\n"
-    "- Return ONLY the JSON object — no markdown fences, no commentary."
+    "CRITICAL RULES:\n"
+    "1. ONE STOP PER CUSTOMER, NOT PER ROW. The sheet has a customer/sequence "
+    "number column (e.g. 1, 2, 3). Each distinct numbered customer is exactly "
+    "ONE stop. A single customer often spans several table rows (one row per "
+    "parcel, barcode or document line) — MERGE those rows into the SAME stop "
+    "and add up their quantities into package_count. Do NOT emit a separate "
+    "stop for each row. If the sheet shows 3 customers, return 3 stops.\n"
+    "2. READ EACH STOP'S OWN DATA. site_name, contact_phone, city and address "
+    "must come from THAT customer's own rows. NEVER copy a name, phone, city or "
+    "address from one stop onto another. If two stops really share a value, "
+    "only repeat it when you can clearly read it on both.\n"
+    "3. LEAVE BLANK WHEN UNSURE. If a field is empty, unreadable, or you are "
+    "guessing, use \"\" (or 0 for package_count). An empty field is correct; an "
+    "invented or copied-from-elsewhere value is a serious error.\n"
+    "4. LOCATION: put the town/city (e.g. מגדל שמס, חיפה, קריות) in city and any "
+    "street in address. Copy them EXACTLY as written. If only a town is given, "
+    "fill city and leave address empty. NEVER fabricate a street — the system "
+    "resolves the real address afterwards from what you give.\n"
+    "5. The recipient/business name goes in site_name; a contact person (if "
+    "separate) in contact_name; the recipient's phone in contact_phone.\n"
+    "6. Keep Hebrew text in Hebrew. Keep stops in the order they appear.\n"
+    "7. Return ONE entry in \"drivers\" per route/driver (the driver name, ID and "
+    "route number are in the sheet header). Most sheets have a single driver.\n"
+    "Return ONLY the JSON object — no markdown, no commentary."
 )
 
 
@@ -71,7 +82,7 @@ def _client():
         return None
 
 
-def _pdf_to_pngs(pdf_bytes, max_pages=12, dpi=170):
+def _pdf_to_pngs(pdf_bytes, max_pages=12, dpi=200):
     """Rasterize each PDF page to PNG bytes via PyMuPDF."""
     import fitz  # PyMuPDF
     pages = []
@@ -118,13 +129,30 @@ def parse_delivery_sheet(file_bytes, content_type="", filename=""):
             })
 
         model = (getattr(settings, "OPENAI_VISION_MODEL", "") or "gpt-4o").strip()
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            temperature=0,
-            max_tokens=4000,
-            response_format={"type": "json_object"},
-        )
+        # GPT-5.x / o-series are reasoning models: they reject a custom
+        # `temperature` and want `max_completion_tokens` instead of `max_tokens`.
+        # Classic models (gpt-4o, gpt-4o-mini) use the old params. Pick per model
+        # so the same code works whichever you set in OPENAI_VISION_MODEL.
+        is_reasoning = model.lower().startswith(("gpt-5", "o1", "o3", "o4"))
+        kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+        }
+        if is_reasoning:
+            kwargs["max_completion_tokens"] = 6000
+        else:
+            kwargs["temperature"] = 0
+            kwargs["max_tokens"] = 6000
+        resp = client.chat.completions.create(**kwargs)
+        try:
+            u = resp.usage
+            print(f"[AI-SHEET] model={model} pages={len(images)} "
+                  f"in={getattr(u,'prompt_tokens','?')} "
+                  f"out={getattr(u,'completion_tokens','?')} "
+                  f"total={getattr(u,'total_tokens','?')}", flush=True)
+        except Exception:
+            pass
         raw = (resp.choices[0].message.content or "{}").strip()
         data = json.loads(raw)
 
