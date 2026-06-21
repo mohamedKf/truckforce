@@ -45,6 +45,11 @@ _PROMPT = (
     "parcel, barcode or document line) — MERGE those rows into the SAME stop "
     "and add up their quantities into package_count. Do NOT emit a separate "
     "stop for each row. If the sheet shows 3 customers, return 3 stops.\n"
+    "1b. IGNORE NON-CUSTOMER ROWS COMPLETELY. Do NOT output a stop for: "
+    "summary or total rows (e.g. \"סה\u05f4כ\", \"סהכ\", \"סה\u05f4כ החלטות\", "
+    "\"total\", \"subtotal\"), header rows, or any row that has no recipient "
+    "name. These are not deliveries. NEVER output a stop whose site_name is "
+    "empty or is a totals/summary label — skip it entirely.\n"
     "2. READ EACH STOP'S OWN DATA. site_name, contact_phone, city and address "
     "must come from THAT customer's own rows. NEVER copy a name, phone, city or "
     "address from one stop onto another. If two stops really share a value, "
@@ -67,6 +72,30 @@ _PROMPT = (
 
 def _empty(error=None):
     return {"error": error, "date": "", "drivers": []}
+
+
+def _looks_like_summary(name):
+    """True if a stop name is really a totals/summary row (e.g. סה״כ החלטות),
+    not a customer. Strips quotes/gershayim/spaces, then checks the סהכ prefix."""
+    n = "".join(ch for ch in (name or "")
+                if ch not in " \t\"'\u05f4\u05f3").strip()
+    return n.startswith("\u05e1\u05d4\u05db")  # "סהכ"
+
+
+def _is_real_stop(s):
+    """Keep only rows that are actual deliveries. Drops summary/total rows and
+    rows with no identifying content at all (the blank rows the model emits
+    from a dense, photographed table)."""
+    name = (s.get("site_name") or "").strip()
+    if _looks_like_summary(name):
+        return False
+    return any((
+        name,
+        (s.get("contact_name") or "").strip(),
+        (s.get("contact_phone") or "").strip(),
+        (s.get("address") or "").strip(),
+        (s.get("city") or "").strip(),
+    ))
 
 
 def _client():
@@ -202,6 +231,9 @@ def _parse_images(images):
             d = entry.get("driver") or {}
             stops = [_norm_stop(s) for s in (entry.get("stops") or [])
                      if isinstance(s, dict)]
+            # Drop totals/summary rows and empty rows the model emits from a
+            # dense, photographed table (these are not real deliveries).
+            stops = [s for s in stops if _is_real_stop(s)]
             out_drivers.append({
                 "driver": {
                     "name": str(d.get("name", "") or ""),
