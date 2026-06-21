@@ -5914,35 +5914,43 @@ class PlaceResolveView(APIView):
 
 # ─── AI delivery-sheet reader ───────────────────────────────────────────────
 class ParseDeliverySheetView(APIView):
-    """Manager uploads a delivery sheet (photo or PDF); we OCR/parse it with
-    OpenAI vision and return structured {driver, matched_driver, date, stops}
-    for the desktop "Review & Import" popup. Graceful if OpenAI isn't set up."""
-    permission_classes = [IsManager]
+    """Upload a delivery sheet (PDF, one photo, or several photos) and get back
+    structured {date, drivers:[{driver, matched_driver, stops}]}.
+
+    Used by the desktop "Review & Import" popup (manager) and by the driver app
+    "Scan sheet" flow (driver scans his own papers). Graceful if OpenAI is off.
+    """
+    permission_classes = [IsManagerOrDriver]
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
-        f = request.FILES.get('file') or request.FILES.get('sheet')
-        if not f:
+        # Accept many photos ('files') OR a single file ('file'/'sheet').
+        uploads = request.FILES.getlist('files')
+        if not uploads:
+            single = request.FILES.get('file') or request.FILES.get('sheet')
+            uploads = [single] if single else []
+        if not uploads:
             return Response({'error': 'no_file'}, status=400)
-        try:
-            file_bytes = f.read()
-        except Exception:
-            return Response({'error': 'read_failed'}, status=400)
-        if not file_bytes:
+
+        files = []
+        for f in uploads:
+            try:
+                fb = f.read()
+            except Exception:
+                continue
+            if fb:
+                files.append((fb, getattr(f, 'content_type', '') or '',
+                              getattr(f, 'name', '') or ''))
+        if not files:
             return Response({'error': 'empty_file'}, status=400)
 
-        from .ai_delivery_sheet import parse_delivery_sheet, match_driver
-        result = parse_delivery_sheet(
-            file_bytes,
-            content_type=getattr(f, 'content_type', '') or '',
-            filename=getattr(f, 'name', '') or '',
-        )
+        from .ai_delivery_sheet import parse_delivery_files, match_driver
+        result = parse_delivery_files(files)
         if result.get('error') == 'no_openai_key':
             return Response(
                 {'error': 'OpenAI is not configured on the server.'},
                 status=503)
-        # Attach a best-effort driver match to each route so the UI can
-        # pre-select the right driver (the manager confirms/changes it).
         for entry in result.get('drivers', []):
             entry['matched_driver'] = match_driver(entry.get('driver'))
         return Response(result, status=200)
+

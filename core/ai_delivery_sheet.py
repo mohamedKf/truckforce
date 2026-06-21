@@ -106,20 +106,42 @@ def _is_pdf(file_bytes, content_type, filename):
     return (filename or "").lower().endswith(".pdf")
 
 
+def _collect_images(files, max_total=12):
+    """files: list of (bytes, content_type, filename). Flatten into image
+    blobs — PDF pages rasterized, photos used as-is — capped at max_total."""
+    images = []
+    for fb, ct, fn in files:
+        if not fb:
+            continue
+        if _is_pdf(fb, ct, fn):
+            images.extend(_pdf_to_pngs(fb))
+        else:
+            images.append(fb)
+        if len(images) >= max_total:
+            break
+    return images[:max_total]
+
+
 def parse_delivery_sheet(file_bytes, content_type="", filename=""):
-    """Parse a delivery sheet into {driver, date, stops}. Never raises."""
+    """Parse ONE delivery sheet (PDF or single image). Backward-compatible."""
+    return _parse_images(_collect_images([(file_bytes, content_type, filename)]))
+
+
+def parse_delivery_files(files):
+    """Parse MANY files at once — e.g. several phone photos of the papers.
+    `files` is a list of (bytes, content_type, filename). Never raises."""
+    return _parse_images(_collect_images(files))
+
+
+def _parse_images(images):
+    """Shared core: send the page/photo images to the vision model and return
+    the normalized {date, drivers:[...]} structure. Never raises."""
     client = _client()
     if client is None:
         return _empty("no_openai_key")
-
+    if not images:
+        return _empty("no_pages")
     try:
-        if _is_pdf(file_bytes, content_type, filename):
-            images = _pdf_to_pngs(file_bytes)
-        else:
-            images = [file_bytes]  # already an image
-        if not images:
-            return _empty("no_pages")
-
         content = [{"type": "text", "text": _PROMPT}]
         for img in images:
             b64 = base64.b64encode(img).decode("ascii")
