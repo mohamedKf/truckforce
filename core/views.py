@@ -5954,3 +5954,19 @@ class ParseDeliverySheetView(APIView):
             entry['matched_driver'] = match_driver(entry.get('driver'))
         return Response(result, status=200)
 
+
+class SendDeliveryNoteView(APIView):
+    """Send/re-send a stop's signed delivery note by email or WhatsApp."""
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request, stop_id):
+        from .delivery_send import send_note
+        stop = get_object_or_404(Stop, pk=stop_id)
+        status_code, payload = send_note(
+            stop,
+            request.data.get('channel'),
+            request.data.get('email'),
+            request.data.get('phone'),
+            request,
+        )
+        return Response(payload, status=status_code)

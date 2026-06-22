@@ -24,8 +24,11 @@ from django.conf import settings
 _PROMPT = (
     "You are a careful data-extraction assistant for a logistics company in "
     "Israel. The image is a delivery route sheet (often photographed at an "
-    "angle or rotated, and partly handwritten). Read it as-is and return ONLY "
-    "a JSON object with EXACTLY this shape:\n"
+    "angle or rotated, and partly handwritten). The photo may be rotated 90° "
+    "or 180°; mentally rotate it so the Hebrew reads right-to-left and is "
+    "legible BEFORE extracting. If after rotating it is still not clearly "
+    "legible, follow rule 0 below and do not guess. Read it as-is and return "
+    "ONLY a JSON object with EXACTLY this shape:\n"
     "{\n"
     '  "date": "YYYY-MM-DD or empty string",\n'
     '  "drivers": [\n'
@@ -39,6 +42,17 @@ _PROMPT = (
     "  ]\n"
     "}\n"
     "CRITICAL RULES:\n"
+    "0. NEVER INVENT DATA — THIS OVERRIDES EVERYTHING. Only output a customer "
+    "you can actually SEE and READ on the sheet. If the photo is too rotated, "
+    "blurry, dark, skewed, or low-quality to read the customer names with "
+    "confidence, return FEWER stops — or an empty \"drivers\" list — rather "
+    "than guessing. Any store name, address, city or phone you cannot read "
+    "directly from the image MUST be left empty or omitted. Do NOT output "
+    "plausible-sounding but unverified values. Before returning, re-check that "
+    "every site_name you wrote is text ACTUALLY VISIBLE in the image, not an "
+    "inference or a guess. Returning nothing is the correct answer when the "
+    "sheet is unreadable; fabricating even one customer is the worst possible "
+    "outcome.\n"
     "1. ONE STOP PER CUSTOMER, NOT PER ROW. The sheet has a customer/sequence "
     "number column (e.g. 1, 2, 3). Each distinct numbered customer is exactly "
     "ONE stop. A single customer often spans several table rows (one row per "
@@ -164,6 +178,70 @@ def parse_delivery_files(files):
     return _parse_images(_collect_images(files))
 
 
+def _auto_rotate_degrees(client, jpeg_bytes):
+    """Ask a cheap vision model which CLOCKWISE rotation makes the page
+    upright. Returns 0/90/180/270; falls back to 0 on any error."""
+    orient_model = (getattr(settings, "OPENAI_ORIENT_MODEL", "")
+                    or "gpt-4o-mini").strip()
+    try:
+        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+        resp = client.chat.completions.create(
+            model=orient_model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text":
+                 "This is a photo of a printed paper document. By how many "
+                 "degrees CLOCKWISE must it be rotated so the text is upright "
+                 "and readable? Answer with ONLY one number: 0, 90, 180, or "
+                 "270."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            ]}],
+            max_tokens=4,
+            temperature=0,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        for d in ("270", "180", "90", "0"):
+            if d in txt:
+                return int(d)
+    except Exception as e:
+        print(f"[AI-SHEET] orient detect failed: {e}", flush=True)
+    return 0
+
+
+def _preprocess(png_bytes, client):
+    """Straighten + clean a photographed sheet so the model can actually read
+    it: honor EXIF orientation, auto-rotate upright, grayscale + autocontrast,
+    cap the long side. Returns PNG bytes (the original on any failure)."""
+    if not getattr(settings, "OPENAI_SHEET_PREPROCESS", True):
+        return png_bytes
+    try:
+        import io
+        from PIL import Image, ImageOps
+        img = Image.open(io.BytesIO(png_bytes))
+        img = ImageOps.exif_transpose(img)  # honor camera orientation tag
+        # Detect rotation on the current (post-EXIF) image.
+        probe = io.BytesIO()
+        img.convert("RGB").save(probe, format="JPEG", quality=85)
+        deg = _auto_rotate_degrees(client, probe.getvalue())
+        if deg:
+            img = img.rotate(-deg, expand=True)  # PIL is CCW; negate for CW
+        img = ImageOps.grayscale(img)
+        img = ImageOps.autocontrast(img, cutoff=1)
+        long_side = max(img.size)
+        if long_side > 2200:
+            scale = 2200 / long_side
+            img = img.resize((int(img.width * scale), int(img.height * scale)),
+                             Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        print(f"[AI-SHEET] preprocess: rotated={deg}deg size={img.size}",
+              flush=True)
+        return out.getvalue()
+    except Exception as e:
+        print(f"[AI-SHEET] preprocess failed: {e}", flush=True)
+        return png_bytes
+
+
 def _parse_images(images):
     """Shared core: send the page/photo images to the vision model and return
     the normalized {date, drivers:[...]} structure. Never raises."""
@@ -175,6 +253,7 @@ def _parse_images(images):
     try:
         content = [{"type": "text", "text": _PROMPT}]
         for img in images:
+            img = _preprocess(img, client)
             b64 = base64.b64encode(img).decode("ascii")
             content.append({
                 "type": "image_url",

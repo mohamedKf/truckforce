@@ -162,4 +162,5 @@ urlpatterns = [
 
     # ── AI delivery-sheet reader ──────────────────────────────────────
     path('ai/parse-delivery-sheet/',         views.ParseDeliverySheetView.as_view()),
+    path('stops/<int:stop_id>/send-note/', views.SendDeliveryNoteView.as_view()),
 ]
