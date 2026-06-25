@@ -3449,20 +3449,19 @@ class DriverPingView(APIView):
 def app_version(request):
     """
     GET /api/version/
-    No auth — desktop and phone check this on startup.
+    No auth — desktop checks this on startup.
+    Latest version + download link come from env vars (set on Railway), so they
+    survive redeploys (the old version.json in RELEASES_DIR did not).
+    The .exe itself is hosted on our website; download_url points there.
     """
-    ver_file = os.path.join(RELEASES_DIR, 'version.json')
-    try:
-        with open(ver_file) as f:
-            return JsonResponse(json.load(f))
-    except FileNotFoundError:
-        return JsonResponse({
-            'version':      '1.0.0',
-            'exe_url':      '',
-            'apk_url':      '',
-            'notes':        'Initial release',
-            'force_update': False,
-        })
+    from django.conf import settings
+    return JsonResponse({
+        'version':      getattr(settings, 'DESKTOP_VERSION', '1.0.0'),
+        'download_url': getattr(settings, 'DESKTOP_DOWNLOAD_URL', ''),
+        'exe_url':      getattr(settings, 'DESKTOP_DOWNLOAD_URL', ''),  # alias for older clients
+        'notes':        getattr(settings, 'DESKTOP_UPDATE_NOTES', ''),
+        'force_update': getattr(settings, 'DESKTOP_FORCE_UPDATE', False),
+    })
 
 
 def download_release(request, filename):

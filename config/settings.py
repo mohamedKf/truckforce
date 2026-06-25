@@ -92,6 +92,15 @@ DATABASES = {
 REGISTRATION_CODE    = config('REGISTRATION_CODE',    default='TF-2025')
 REGISTRATION_ENABLED = config('REGISTRATION_ENABLED', default=True, cast=bool)
 
+# ── Desktop app version / update ──────────────────────────
+# Bump DESKTOP_VERSION (and DESKTOP_DOWNLOAD_URL if the file name changes) on
+# Railway when you publish a new .exe to the website, then redeploy. The desktop
+# app compares its baked-in version to this and prompts when this one is newer.
+DESKTOP_VERSION      = config('DESKTOP_VERSION',      default='1.0.0')
+DESKTOP_DOWNLOAD_URL = config('DESKTOP_DOWNLOAD_URL', default='')
+DESKTOP_UPDATE_NOTES = config('DESKTOP_UPDATE_NOTES', default='')
+DESKTOP_FORCE_UPDATE = config('DESKTOP_FORCE_UPDATE', default=False, cast=bool)
+
 # ── Cache (for tokens) ────────────────────────────────────
 CACHES = {
     'default': {

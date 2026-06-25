@@ -200,7 +200,9 @@ class DriverListSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Driver
         fields = ['id', 'full_name', 'username', 'license_type',
-                  'crane_certified', 'is_active', 'phone']
+                  'crane_certified', 'is_active', 'phone',
+                  # expiry dates needed by the notification bell
+                  'license_expiry', 'crane_license_expiry']
 
 
 # ──────────────────────────────────────────────
@@ -231,7 +233,11 @@ class TruckListSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Truck
         fields = ['id', 'brand', 'model', 'plate_number',
-                  'capacity_tons', 'has_crane', 'status']
+                  'capacity_tons', 'has_crane', 'status',
+                  # dates needed by the trucks page cells + notification bell
+                  'last_service_date', 'next_service_date',
+                  'last_tire_change', 'next_tire_change',
+                  'last_inspection', 'next_inspection']
 
 
 # ──────────────────────────────────────────────
@@ -622,7 +628,14 @@ class PayslipSummarySerializer(serializers.ModelSerializer):
     class Meta:
         model  = Payslip
         fields = ['id', 'driver', 'driver_name', 'year', 'month',
-                  'working_days', 'total_hours', 'gross_pay', 'net_pay', 'status']
+                  'working_days', 'total_hours', 'gross_pay', 'net_pay', 'status',
+                  # breakdown — needed by the phone payslip detail (it reuses list data)
+                  'regular_hours', 'overtime_125_h', 'overtime_150_h', 'crane_hours',
+                  'base_pay', 'overtime_125_pay', 'overtime_150_pay', 'crane_pay',
+                  'travel_allowance', 'bonus',
+                  'income_tax', 'national_ins', 'health_ins',
+                  'pension_emp', 'study_fund_emp', 'other_deductions', 'total_deductions',
+                  'pension_employer', 'study_fund_employer', 'severance_employer']
 
 
 # ──────────────────────────────────────────────
