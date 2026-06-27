@@ -5969,3 +5969,73 @@ class SendDeliveryNoteView(APIView):
             request,
         )
         return Response(payload, status=status_code)
+
+
+
+class DriverStopEditView(APIView):
+    """Driver edits or deletes a stop on their OWN schedule.
+
+    Only stops that are still pending may be changed — a completed (done or
+    skipped) delivery is locked. Lets a driver fix details they mistyped
+    (address, items, contact, etc.) or remove a stop they added by mistake.
+    """
+    permission_classes = [IsDriver]
+
+    # Detail fields a driver may change. Mirrors the self-create flow.
+    _EDITABLE = (
+        'site_name', 'address', 'latitude', 'longitude',
+        'notes', 'contact_name', 'contact_phone',
+        'items', 'stop_type',
+    )
+
+    def _get_stop(self, request, pk):
+        return Stop.objects.get(pk=pk, schedule__driver=request.driver)
+
+    def patch(self, request, pk):
+        try:
+            stop = self._get_stop(request, pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        if stop.status in ('done', 'skipped') or stop.completed_at:
+            return Response(
+                {'error': 'This stop is already completed and can no longer be edited'},
+                status=400)
+
+        for field in self._EDITABLE:
+            if field in request.data:
+                val = request.data.get(field)
+                # Empty coordinate → NULL, so a blank doesn't break the Decimal field.
+                if field in ('latitude', 'longitude') and (val == '' or val is None):
+                    val = None
+                setattr(stop, field, val)
+
+        if not (stop.site_name or '').strip():
+            return Response({'error': 'site_name is required'}, status=400)
+
+        stop.save()
+        try:
+            publish_event('schedules_changed',
+                          by_user_id=getattr(request.driver, 'id', None))
+        except Exception:
+            pass
+        return Response(StopSerializer(stop).data)
+
+    def delete(self, request, pk):
+        try:
+            stop = self._get_stop(request, pk)
+        except Stop.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        if stop.status in ('done', 'skipped') or stop.completed_at:
+            return Response(
+                {'error': 'This stop is already completed and cannot be deleted'},
+                status=400)
+
+        stop.delete()
+        try:
+            publish_event('schedules_changed',
+                          by_user_id=getattr(request.driver, 'id', None))
+        except Exception:
+            pass
+        return Response({'ok': True}, status=200)
