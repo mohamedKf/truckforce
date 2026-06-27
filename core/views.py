@@ -721,6 +721,7 @@ class DriverSelfScheduleView(APIView):
                 notes=st.get('notes', ''),
                 contact_name=st.get('contact_name', ''),
                 contact_phone=st.get('contact_phone', ''),
+                contact_email=st.get('contact_email', ''),
                 items=st.get('items', ''),
                 stop_type=st.get('stop_type', 'delivery'),
             )
@@ -5984,7 +5985,7 @@ class DriverStopEditView(APIView):
     # Detail fields a driver may change. Mirrors the self-create flow.
     _EDITABLE = (
         'site_name', 'address', 'latitude', 'longitude',
-        'notes', 'contact_name', 'contact_phone',
+        'notes', 'contact_name', 'contact_phone', 'contact_email',
         'items', 'stop_type',
     )
 
