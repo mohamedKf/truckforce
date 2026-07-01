@@ -1093,6 +1093,51 @@ class AttendanceDetailView(APIView):
 # CRANE SESSION
 # ──────────────────────────────────────────────
 
+class AttendanceMonthlySummaryView(APIView):
+    """Per-driver total hours + days worked in a given month. Manager only.
+
+    Independent of payroll — it just sums attendance (clock_in → clock_out)
+    time and counts days that have a clock-in. Hours for a still-open shift
+    count only once the driver clocks out.
+
+    GET /attendance/monthly-summary/?month=YYYY-MM   (defaults to this month)
+    """
+    permission_classes = [IsManager]
+
+    def get(self, request):
+        from datetime import date
+        raw = request.query_params.get('month', '')
+        try:
+            year, month = map(int, raw.split('-'))
+        except Exception:
+            today = date.today()
+            year, month = today.year, today.month
+
+        qs = (Attendance.objects
+              .filter(date__year=year, date__month=month)
+              .select_related('driver'))
+
+        summary = {}
+        for att in qs:
+            row = summary.setdefault(att.driver_id, {
+                'driver_id':   att.driver_id,
+                'driver_name': att.driver.full_name,
+                'total_hours': 0.0,
+                'total_days':  0,
+            })
+            if att.clock_in:
+                row['total_days'] += 1
+            row['total_hours'] += att.total_hours  # 0 if not clocked out yet
+
+        for row in summary.values():
+            row['total_hours'] = round(row['total_hours'], 2)
+
+        return Response({
+            'month': f"{year:04d}-{month:02d}",
+            'drivers': list(summary.values()),
+        })
+
+
 class CraneStartView(APIView):
     permission_classes = [IsDriver]
 
@@ -6040,4 +6085,3 @@ class DriverStopEditView(APIView):
         except Exception:
             pass
         return Response({'ok': True}, status=200)
-

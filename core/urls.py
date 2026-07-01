@@ -165,5 +165,6 @@ urlpatterns = [
     path('stops/<int:stop_id>/send-note/', views.SendDeliveryNoteView.as_view()),
     path('stops/<int:pk>/driver-edit/',   views.DriverStopEditView.as_view()),  # driver: edit/delete own pending stop
 
+    path('attendance/monthly-summary/', views.AttendanceMonthlySummaryView.as_view()),
 
 ]
