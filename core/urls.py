@@ -17,6 +17,7 @@ urlpatterns = [
 
     # ── Managers ──────────────────────────────────────
     path('managers/',                     views.ManagerListCreateView.as_view()),
+    path('managers/fcm/',                 views.ManagerUpdateFCMView.as_view()),
     path('managers/<int:pk>/',            views.ManagerDetailView.as_view()),
 
     # ── Drivers — specific before <int:pk> ────────────
@@ -150,6 +151,27 @@ urlpatterns = [
     # ── Invoicing module (paid add-on; gated server-side) ─────────────
     path('billing/clients/',                 views.ClientListCreateView.as_view()),
     path('billing/clients/<int:pk>/',        views.ClientDetailView.as_view()),
+
+    # ── Client directory & package catalogue ──────────
+    # A saved customer is a destination as well as a billing entity, so the
+    # picker lives outside billing/ and drivers can read it. Creating a stop
+    # from one is additive: schedules/<id>/stops/ still takes a typed stop.
+    path('clients/directory/',
+         views.ClientDirectoryView.as_view()),
+    # Packages a client is owed, per delivery date. Not a standing list —
+    # what a customer takes changes from one day to the next.
+    path('package-orders/',
+         views.PackageOrderListCreateView.as_view()),
+    path('package-orders/<int:pk>/',
+         views.PackageOrderDetailView.as_view()),
+    path('package-orders/reschedule/',
+         views.PackageOrderRescheduleView.as_view()),
+    path('catalog/packages/',
+         views.CatalogPackageListCreateView.as_view()),
+    path('catalog/packages/<int:pk>/',
+         views.CatalogPackageDetailView.as_view()),
+    path('schedules/<int:schedule_id>/stops/from-client/',
+         views.StopFromClientView.as_view()),
     path('billing/invoices/',                views.InvoiceListCreateView.as_view()),
     path('billing/invoices/<int:pk>/issue/', views.InvoiceIssueView.as_view()),
     path('billing/invoices/<int:pk>/',       views.InvoiceDetailView.as_view()),

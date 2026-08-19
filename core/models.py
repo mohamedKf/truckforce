@@ -289,6 +289,18 @@ class Stop(models.Model):
     order           = models.PositiveIntegerField()
     site_name       = models.CharField(max_length=200)
     address         = models.TextField()
+
+    # Where this stop came from, when it was built by picking a saved client
+    # rather than typed by hand. SET_NULL because deleting a customer from the
+    # directory must not delete the history of what was delivered to them, and
+    # the stop already carries its own copy of the name and address.
+    #
+    # The copy is deliberate: a stop is a record of where the truck went that
+    # day. Reading the address through the client would silently rewrite last
+    # month's routes the first time the office corrects a typo.
+    client          = models.ForeignKey('Client', on_delete=models.SET_NULL,
+                        null=True, blank=True, related_name='stops',
+                        help_text='Saved client this stop was created from')
     latitude        = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     longitude       = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     notes           = models.TextField(blank=True)
@@ -1171,13 +1183,24 @@ class StopTask(models.Model):
 # ──────────────────────────────────────────────────────────────────────
 
 class Client(models.Model):
-    """A business customer of the hauling company — the entity that gets
-    billed. (Not to be confused with TruckForce's own clients; this is the
-    hauler's customer: the building-materials buyer, the site, etc.)"""
+    """A business customer of the hauling company.
+
+    Started life as the billing entity for the invoicing add-on, and is now
+    also the dispatch directory: a saved customer a stop can be built from in
+    one pick, instead of retyping the site name, address and contact every
+    time. The billing fields stay where they were so invoicing is unaffected;
+    everything under "Delivery identity" below is what makes a Client usable
+    as a destination.
+
+    `address` remains the BILLING address (what goes on an invoice).
+    `site_address` is where the truck actually goes — often a yard or a
+    building site at a different place entirely.
+    """
     name            = models.CharField(max_length=200)
     tax_id          = models.CharField(max_length=20, blank=True,
                                        help_text='ח.פ / עוסק מורשה')
-    address         = models.TextField(blank=True)
+    address         = models.TextField(blank=True,
+                                       help_text='Billing address — printed on invoices')
     contact_name    = models.CharField(max_length=120, blank=True)
     phone           = models.CharField(max_length=30, blank=True)
     email           = models.EmailField(blank=True)
@@ -1189,11 +1212,50 @@ class Client(models.Model):
     is_active       = models.BooleanField(default=True)
     created_at      = models.DateTimeField(auto_now_add=True)
 
+    # ── Delivery identity ─────────────────────────────────
+    # What a Stop is built from. site_name is the label the driver sees on the
+    # route; it defaults to the company name when left blank.
+    site_name       = models.CharField(max_length=200, blank=True,
+                        help_text='Label shown on the route. Blank → the client name')
+    site_address    = models.TextField(blank=True,
+                        help_text='Where the truck goes, when that is not the billing address')
+    latitude        = models.DecimalField(max_digits=9, decimal_places=6,
+                        null=True, blank=True)
+    longitude       = models.DecimalField(max_digits=9, decimal_places=6,
+                        null=True, blank=True)
+    # Either input the office pasted. Kept verbatim so a failed geocode can be
+    # retried later without asking the office to find the link again.
+    location_url    = models.TextField(blank=True,
+                        help_text='Google Maps / Waze share link, parsed into coordinates')
+    google_place_id = models.CharField(max_length=200, blank=True,
+                        help_text='Google Places id, when picked from the search box')
+
+    # Contact at the SITE, when it differs from the billing contact above.
+    site_contact_name  = models.CharField(max_length=100, blank=True)
+    site_contact_phone = models.CharField(max_length=30, blank=True)
+
+    delivery_notes  = models.TextField(blank=True,
+                        help_text='Standing instructions — gate code, which entrance, call ahead')
+
     class Meta:
         ordering = ['name']
 
     def __str__(self):
         return self.name
+
+    # ── Helpers used when a Stop is built from this client ──
+
+    @property
+    def route_label(self) -> str:
+        return self.site_name or self.name
+
+    @property
+    def route_address(self) -> str:
+        return self.site_address or self.address
+
+    @property
+    def has_coordinates(self) -> bool:
+        return self.latitude is not None and self.longitude is not None
 
 
 class Invoice(models.Model):
@@ -1353,3 +1415,205 @@ class FinanceDocument(models.Model):
 
     def __str__(self):
         return f"{self.get_kind_display()} {self.doc_date} — {self.vendor_name or self.description or self.pk}"
+
+# ──────────────────────────────────────────────
+# PACKAGE CATALOGUE
+# ──────────────────────────────────────────────
+# `Package` (further up) is a line on ONE stop — created when that delivery is
+# planned and thrown away with it. This is the other thing: a standing list of
+# what the company actually ships, so the office picks "3 × pallet of tiles"
+# instead of retyping the code, the weight and the description every time.
+#
+# The two are deliberately separate. A catalogue row is a template; copying it
+# onto a stop produces a Package that the driver then loads, delivers or
+# returns. Editing the catalogue afterwards must never rewrite the history of
+# what was already delivered, which is exactly what sharing one row would do.
+
+class CatalogPackage(models.Model):
+    """A product/package the company ships, kept once and reused."""
+
+    UNIT_CHOICES = [
+        ('pallet', 'משטח'),
+        ('unit',   'יחידה'),
+        ('box',    'קרטון'),
+        ('bag',    'שק'),
+        ('ton',    'טון'),
+        ('m3',     'מ״ק'),
+    ]
+
+    package_number = models.CharField(max_length=60, blank=True, db_index=True,
+                        help_text='מספר חבילה — the number the office refers to it by')
+    code           = models.CharField(max_length=60, blank=True, db_index=True,
+                        help_text='מק״ט / product code')
+    name           = models.CharField(max_length=200)
+    description    = models.TextField(blank=True)
+    barcode        = models.CharField(max_length=80, blank=True)
+
+    unit           = models.CharField(max_length=10, choices=UNIT_CHOICES,
+                                      default='pallet')
+    weight_kg      = models.DecimalField(max_digits=8, decimal_places=2,
+                                         null=True, blank=True)
+    length_cm      = models.DecimalField(max_digits=7, decimal_places=1,
+                                         null=True, blank=True)
+    width_cm       = models.DecimalField(max_digits=7, decimal_places=1,
+                                         null=True, blank=True)
+    height_cm      = models.DecimalField(max_digits=7, decimal_places=1,
+                                         null=True, blank=True)
+
+    # What a client is charged per unit, when the invoicing add-on is on.
+    price_per_unit = models.DecimalField(max_digits=10, decimal_places=2,
+                                         default=0)
+
+    notes          = models.TextField(blank=True)
+    is_active      = models.BooleanField(default=True)
+    created_at     = models.DateTimeField(auto_now_add=True)
+    updated_at     = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        indexes = [models.Index(fields=['code', 'package_number'])]
+
+    def __str__(self):
+        label = self.code or self.package_number
+        return f"{self.name} ({label})" if label else self.name
+
+    def as_stop_package_kwargs(self, quantity: int = None) -> dict:
+        """The fields to copy onto a per-stop Package.
+
+        Only the identity travels; state (loaded, delivered) belongs to the
+        stop and always starts fresh.
+        """
+        return {
+            'product_name': self.name,
+            'product_code': self.code,
+            'barcode':      self.barcode,
+            'quantity_pallets': quantity if self.unit == 'pallet' else 0,
+            'quantity_units':   quantity if self.unit != 'pallet' else 0,
+            'weight_kg':    self.weight_kg,
+        }
+
+
+class PackageOrder(models.Model):
+    """A package a client wants on a particular day.
+
+    This is deliberately NOT a standing list. What a customer takes changes
+    from one delivery to the next, so "client X gets 4 pallets of tiles" is
+    only ever true of a date. An order is created for a day, picked up by the
+    stop built for that client on that day, and closed when the driver
+    finishes — or flagged when they do not.
+
+    The lifecycle is the point:
+
+        pending      created; no stop for it yet
+        scheduled    attached to a stop on its delivery_date
+        delivered    that stop was completed
+        undelivered  the stop was skipped or the day ended without it —
+                     this is the flag the office works from
+        cancelled    called off
+
+    Rescheduling moves the row rather than making a new one: the date changes,
+    the status goes back to pending and the stop link is cleared, while
+    original_date and reschedule_count keep the history. One row per thing the
+    customer is owed means the office can never double-deliver by losing track
+    of which copy was the live one.
+    """
+
+    STATUS_CHOICES = [
+        ('pending',     'ממתין'),
+        ('scheduled',   'משובץ'),
+        ('delivered',   'נמסר'),
+        ('undelivered', 'לא נמסר'),
+        ('cancelled',   'בוטל'),
+    ]
+    # Statuses that still owe the customer something.
+    OPEN_STATUSES = ('pending', 'scheduled', 'undelivered')
+
+    client        = models.ForeignKey(Client, on_delete=models.CASCADE,
+                      related_name='package_orders')
+    package       = models.ForeignKey(CatalogPackage, on_delete=models.PROTECT,
+                      related_name='orders',
+                      help_text='PROTECT: a catalogue row with history is '
+                                'deactivated, never deleted out from under it')
+    quantity      = models.PositiveIntegerField(default=1)
+
+    delivery_date = models.DateField(db_index=True,
+                      help_text='The day this is to be delivered')
+    status        = models.CharField(max_length=12, choices=STATUS_CHOICES,
+                      default='pending', db_index=True)
+
+    # The stop that picked this up, once one exists for the client and day.
+    stop          = models.ForeignKey('Stop', on_delete=models.SET_NULL,
+                      null=True, blank=True, related_name='package_orders')
+
+    delivered_at  = models.DateTimeField(null=True, blank=True)
+    # Why it did not go out, when it did not.
+    failure_reason = models.TextField(blank=True)
+
+    # Rescheduling trail.
+    original_date    = models.DateField(null=True, blank=True,
+                         help_text='The first date asked for, kept across moves')
+    reschedule_count = models.PositiveIntegerField(default=0)
+
+    price_override = models.DecimalField(max_digits=10, decimal_places=2,
+                                         null=True, blank=True)
+    notes          = models.TextField(blank=True)
+    created_at     = models.DateTimeField(auto_now_add=True)
+    updated_at     = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['delivery_date', 'client__name', 'package__name']
+        indexes = [
+            # The two questions actually asked: what does this client need on
+            # this day, and what is still outstanding.
+            models.Index(fields=['client', 'delivery_date']),
+            models.Index(fields=['status', 'delivery_date']),
+        ]
+
+    def __str__(self):
+        return (f"{self.client.name} — {self.package.name} ×{self.quantity} "
+                f"on {self.delivery_date} ({self.status})")
+
+    def save(self, *args, **kwargs):
+        # Remember where it started, so a row moved three times still shows
+        # the day it was first promised for.
+        if self.original_date is None:
+            self.original_date = self.delivery_date
+        super().save(*args, **kwargs)
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in self.OPEN_STATUSES
+
+    @property
+    def was_rescheduled(self) -> bool:
+        return bool(self.original_date and self.original_date != self.delivery_date)
+
+    @property
+    def effective_price(self):
+        return self.price_override if self.price_override is not None \
+            else self.package.price_per_unit
+
+    def mark_delivered(self, when=None):
+        from django.utils import timezone
+        self.status = 'delivered'
+        self.delivered_at = when or timezone.now()
+        self.failure_reason = ''
+        self.save(update_fields=['status', 'delivered_at', 'failure_reason',
+                                 'updated_at'])
+
+    def mark_undelivered(self, reason: str = ''):
+        """The stop did not happen. Flag it; the office decides the new date."""
+        self.status = 'undelivered'
+        self.failure_reason = reason or ''
+        self.save(update_fields=['status', 'failure_reason', 'updated_at'])
+
+    def reschedule_to(self, new_date):
+        """Move this order to another day and put it back in the queue."""
+        self.delivery_date = new_date
+        self.status = 'pending'
+        self.stop = None
+        self.failure_reason = ''
+        self.reschedule_count += 1
+        self.save(update_fields=['delivery_date', 'status', 'stop',
+                                 'failure_reason', 'reschedule_count',
+                                 'updated_at'])

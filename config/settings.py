@@ -72,21 +72,32 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
-# ── Database — MySQL ──────────────────────────────────────
-DATABASES = {
-    'default': {
-        'ENGINE':   'django.db.backends.mysql',
-        'NAME':     config('DB_NAME',     default='truckforce_db'),
-        'USER':     config('DB_USER',     default='root'),
-        'PASSWORD': config('DB_PASSWORD', default=''),
-        'HOST':     config('DB_HOST',     default='127.0.0.1'),
-        'PORT':     config('DB_PORT',     default='3306'),
-        'OPTIONS': {
-            'charset':      'utf8mb4',
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-        },
+# ── Database — MySQL (sqlite available for local dev) ─────
+# Deployments stay on MySQL exactly as before. Setting DB_ENGINE=sqlite in a
+# local .env swaps in a file-backed database, so the app and its tests can be
+# run on a laptop with no MySQL credentials to hand.
+if config('DB_ENGINE', default='mysql') == 'sqlite':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME':   BASE_DIR / config('DB_NAME', default='dev.sqlite3'),
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE':   'django.db.backends.mysql',
+            'NAME':     config('DB_NAME',     default='truckforce_db'),
+            'USER':     config('DB_USER',     default='root'),
+            'PASSWORD': config('DB_PASSWORD', default=''),
+            'HOST':     config('DB_HOST',     default='127.0.0.1'),
+            'PORT':     config('DB_PORT',     default='3306'),
+            'OPTIONS': {
+                'charset':      'utf8mb4',
+                'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+            },
+        }
+    }
 
 # ── Registration (env-only, never stored in DB) ───────────
 REGISTRATION_CODE    = config('REGISTRATION_CODE',    default='TF-2025')

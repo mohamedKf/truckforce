@@ -422,6 +422,10 @@ class StopCreateNestedSerializer(serializers.ModelSerializer):
             'contact_name', 'contact_phone', 'contact_email',
             'invoice_number', 'invoice_signed',
             'pickup_stop',
+            # Which saved client the stop was built from. Without this in the
+            # list DRF drops it silently, and a stop created through the
+            # schedule form would lose the link the picker just made.
+            'client',
         ]
         extra_kwargs = {
             'order':                {'required': False},
@@ -700,13 +704,96 @@ class DeliveryConfirmationSerializer(serializers.ModelSerializer):
 # ──────────────────────────────────────────────
 # INVOICING MODULE
 # ──────────────────────────────────────────────
-from .models import Client, Invoice, InvoiceLine, FinanceDocument
+from .models import (Client, Invoice, InvoiceLine, FinanceDocument,
+                     CatalogPackage, PackageOrder)
+
+
+class CatalogPackageSerializer(serializers.ModelSerializer):
+    """A catalogue row. `unit_display` saves every client translating the code."""
+    unit_display = serializers.CharField(source='get_unit_display', read_only=True)
+
+    class Meta:
+        model = CatalogPackage
+        fields = '__all__' 
+
+
+class PackageOrderSerializer(serializers.ModelSerializer):
+    """One package a client is owed on one day.
+
+    Flattened rather than nested: the packages page, the stop form and the
+    driver all want the package name and the client name beside the quantity,
+    and nesting both objects would send the same rows over and over.
+    """
+    package_name   = serializers.CharField(source='package.name', read_only=True)
+    package_code   = serializers.CharField(source='package.code', read_only=True)
+    package_number = serializers.CharField(source='package.package_number',
+                                           read_only=True)
+    unit           = serializers.CharField(source='package.unit', read_only=True)
+    unit_display   = serializers.CharField(source='package.get_unit_display',
+                                           read_only=True)
+    weight_kg      = serializers.DecimalField(source='package.weight_kg',
+                                              max_digits=8, decimal_places=2,
+                                              read_only=True)
+    client_name    = serializers.CharField(source='client.name', read_only=True)
+    client_label   = serializers.CharField(source='client.route_label',
+                                           read_only=True)
+    status_display = serializers.CharField(source='get_status_display',
+                                           read_only=True)
+    effective_price = serializers.DecimalField(max_digits=10, decimal_places=2,
+                                               read_only=True)
+    was_rescheduled = serializers.BooleanField(read_only=True)
+    is_open         = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = PackageOrder
+        fields = ['id', 'client', 'client_name', 'client_label',
+                  'package', 'package_name', 'package_code', 'package_number',
+                  'unit', 'unit_display', 'weight_kg',
+                  'quantity', 'delivery_date', 'status', 'status_display',
+                  'stop', 'delivered_at', 'failure_reason',
+                  'original_date', 'reschedule_count', 'was_rescheduled',
+                  'is_open', 'price_override', 'effective_price', 'notes',
+                  'created_at', 'updated_at']
+        # Owned by the lifecycle, not by whoever is editing the form.
+        read_only_fields = ['stop', 'delivered_at', 'original_date',
+                            'reschedule_count', 'created_at', 'updated_at']
 
 
 class ClientSerializer(serializers.ModelSerializer):
+    """The saved customer, as both the billing entity and a destination.
+
+    `route_label` / `route_address` are what a Stop would actually be built
+    with, so a client picking a site address different from its billing
+    address does not have to be resolved again by every caller.
+    """
+    route_label     = serializers.CharField(read_only=True)
+    route_address   = serializers.CharField(read_only=True)
+    has_coordinates = serializers.BooleanField(read_only=True)
+    open_order_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Client
         fields = '__all__'
+
+    def get_open_order_count(self, obj):
+        """Packages this client is still owed, on any date."""
+        return obj.package_orders.filter(
+            status__in=PackageOrder.OPEN_STATUSES).count()
+
+
+class ClientDetailSerializer(ClientSerializer):
+    """Client plus the packages it is still owed.
+
+    Used by the pickers, which want to show what is outstanding — not by the
+    client form, which has no package section at all now that packages belong
+    to a date rather than to the customer.
+    """
+    open_orders = serializers.SerializerMethodField()
+
+    def get_open_orders(self, obj):
+        rows = obj.package_orders.filter(
+            status__in=PackageOrder.OPEN_STATUSES).select_related('package')
+        return PackageOrderSerializer(rows, many=True).data
 
 
 class InvoiceLineSerializer(serializers.ModelSerializer):

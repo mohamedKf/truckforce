@@ -391,8 +391,39 @@ class DriverUpdateFCMView(APIView):
             if stolen:
                 print(f"[FCM-REGISTER] reclaimed token from {stolen} other driver(s) "
                       f"for driver={request.driver.id}", flush=True)
+            # Same phone, other role. Driver and manager now ship in one app,
+            # so a device that was a manager's yesterday can be a driver's
+            # today — and the stale Manager row would keep pulling manager
+            # pushes onto this driver's phone.
+            Manager.objects.filter(fcm_token=token).update(fcm_token='')
         request.driver.fcm_token = token
         request.driver.save(update_fields=['fcm_token'])
+        return Response({'detail': 'FCM token updated'})
+
+
+class ManagerUpdateFCMView(APIView):
+    """Manager updates their own FCM token after app launch.
+
+    Mirror of DriverUpdateFCMView. One physical device owns exactly one FCM
+    token, so before claiming it we detach it from every other Manager *and*
+    from any Driver record — otherwise whoever logged in on this phone before
+    keeps receiving pushes on it.
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request):
+        token = request.data.get('fcm_token', '')
+        if token:
+            stolen = (Manager.objects
+                      .filter(fcm_token=token)
+                      .exclude(pk=request.manager.pk)
+                      .update(fcm_token=''))
+            if stolen:
+                print(f"[FCM-REGISTER] reclaimed token from {stolen} other manager(s) "
+                      f"for manager={request.manager.id}", flush=True)
+            Driver.objects.filter(fcm_token=token).update(fcm_token='')
+        request.manager.fcm_token = token
+        request.manager.save(update_fields=['fcm_token'])
         return Response({'detail': 'FCM token updated'})
 
 
@@ -755,7 +786,12 @@ class ScheduleStopsAddView(APIView):
             'expected_arrival', 'notes',
             # Preserved so a reassigned (cloned) stop keeps its full detail.
             'stop_type', 'items', 'contact_name', 'contact_phone',
+            'contact_email',
             'allow_driver_reorder',
+            # Which saved client the office picked this stop from. The stop
+            # still stores its own name and address — this only records where
+            # they came from, so deleting the client cannot rewrite history.
+            'client',
         }
         clean = {k: v for k, v in data.items() if k in EDITABLE}
         if not clean.get('site_name'):
@@ -764,6 +800,37 @@ class ScheduleStopsAddView(APIView):
         stop = Stop.objects.create(schedule=schedule, **clean)
         publish_event('schedules_changed', by_user_id=getattr(request.manager, 'id', None))
         return Response(StopSerializer(stop).data, status=201)
+
+
+def _close_package_orders(stop, status: str, reason: str = ''):
+    """Settle the package orders riding on a stop when the driver finishes it.
+
+    Done → the packages went out. Skipped → they did not, and each one is
+    flagged so it shows up in the office's reschedule queue instead of being
+    quietly forgotten until the customer calls.
+
+    Deliberately driven off the stop's own status rather than asked of the
+    driver separately: they already say whether they completed the stop, and a
+    second question they can disagree with is a second thing to get wrong.
+    """
+    try:
+        orders = stop.package_orders.all()
+    except Exception:
+        return 0
+    touched = 0
+    for order in orders:
+        try:
+            if status == 'done':
+                order.mark_delivered(stop.completed_at)
+            elif status == 'skipped':
+                order.mark_undelivered(reason or getattr(stop, 'skip_reason', ''))
+            else:
+                continue
+            touched += 1
+        except Exception as exc:
+            print(f"[PKG-ORDER] could not close order {order.pk}: {exc}",
+                  flush=True)
+    return touched
 
 
 def _notify_stop_completion(driver, stop, status):
@@ -837,6 +904,7 @@ class StopUpdateView(APIView):
         # Notify managers (toast on desktop + FCM) for done / skipped stops.
         if new_status in ('done', 'skipped'):
             _notify_stop_completion(request.driver, stop, new_status)
+            _close_package_orders(stop, new_status)
 
         # Check if all stops are resolved → update schedule status
         schedule = stop.schedule
@@ -4947,6 +5015,7 @@ class StopCompleteView(APIView):
         # Manager toast (desktop) + FCM for done & skipped stops.
         if action in ('done', 'skipped') and stop.schedule.driver:
             _notify_stop_completion(stop.schedule.driver, stop, action)
+            _close_package_orders(stop, action)
 
         return Response({
             'ok': True,
@@ -5169,8 +5238,13 @@ class ClientListCreateView(APIView):
     def post(self, request):
         ser = ClientSerializer(data=request.data)
         if ser.is_valid():
-            ser.save()
-            return Response(ser.data, status=201)
+            client = ser.save()
+            # A share link is the usual way the office gives us a location.
+            # Turn it into coordinates now, so the first stop built from this
+            # client can navigate without anyone opening the record again.
+            if _resolve_client_location(client) and client.pk:
+                client.save(update_fields=['latitude', 'longitude'])
+            return Response(ClientSerializer(client).data, status=201)
         return Response(ser.errors, status=400)
 
 
@@ -5179,14 +5253,21 @@ class ClientDetailView(APIView):
 
     def get(self, request, pk):
         client = get_object_or_404(Client, pk=pk)
-        return Response(ClientSerializer(client).data)
+        return Response(ClientDetailSerializer(client).data)
 
     def patch(self, request, pk):
         client = get_object_or_404(Client, pk=pk)
+        had_url = client.location_url
         ser = ClientSerializer(client, data=request.data, partial=True)
         if ser.is_valid():
-            ser.save()
-            return Response(ser.data)
+            client = ser.save()
+            # Only re-resolve when the link actually changed, so correcting a
+            # phone number does not fire a geocode request.
+            coords_sent = ('latitude' in request.data or 'longitude' in request.data)
+            if client.location_url != had_url and not coords_sent:
+                if _resolve_client_location(client):
+                    client.save(update_fields=['latitude', 'longitude'])
+            return Response(ClientSerializer(client).data)
         return Response(ser.errors, status=400)
 
     def delete(self, request, pk):
@@ -5742,47 +5823,8 @@ class ParseLocationLinkView(APIView):
         if not text:
             return Response({'error': 'No link provided'}, status=400)
 
-        from django.conf import settings as _dj
-        _gkey = getattr(_dj, 'GOOGLE_GEOCODING_KEY', '') or ''
-        _mtok = getattr(_dj, 'MAPBOX_TOKEN', '') or ''
-
-        def _geocode(name):
-            """Place name -> (lat, lng). Google first (best match for a name
-            that CAME from Google Maps), Mapbox as fallback. None if neither."""
-            if not name:
-                return None
-            import requests as _rq
-            if _gkey:
-                try:
-                    r = _rq.get('https://maps.googleapis.com/maps/api/geocode/json',
-                                params={'address': name, 'key': _gkey, 'region': 'il'},
-                                timeout=10)
-                    if r.status_code == 200:
-                        res = r.json().get('results') or []
-                        if res:
-                            loc = res[0]['geometry']['location']
-                            return (float(loc['lat']), float(loc['lng']))
-                except Exception:
-                    pass
-            if _mtok:
-                try:
-                    import urllib.parse as _up
-                    q = _up.quote(name)
-                    r = _rq.get(
-                        f'https://api.mapbox.com/geocoding/v5/mapbox.places/{q}.json',
-                        params={'access_token': _mtok, 'country': 'il', 'limit': 1},
-                        timeout=10)
-                    if r.status_code == 200:
-                        feats = r.json().get('features') or []
-                        if feats:
-                            c = feats[0]['center']  # [lng, lat]
-                            return (float(c[1]), float(c[0]))
-                except Exception:
-                    pass
-            return None
-
         try:
-            result = location_url_parser.parse(text, geocode=_geocode)
+            result = location_url_parser.parse(text, geocode=geocode_place_name)
         except Exception:
             result = None
         if not result:
@@ -6085,3 +6127,417 @@ class DriverStopEditView(APIView):
         except Exception:
             pass
         return Response({'ok': True}, status=200)
+
+# ══════════════════════════════════════════════
+# CLIENT DIRECTORY & PACKAGE CATALOGUE
+# ══════════════════════════════════════════════
+# A second way to build a stop, alongside typing one by hand. The office saves
+# a customer once — address, coordinates, contact, standing instructions — and
+# the packages that customer usually takes. After that a stop is one pick.
+#
+# Nothing here replaces the manual flow. ScheduleStopsAddView is untouched;
+# these endpoints end in the same Stop rows.
+
+from .models import CatalogPackage, PackageOrder
+from .serializers import (CatalogPackageSerializer, PackageOrderSerializer,
+                          ClientDetailSerializer)
+
+
+def geocode_place_name(name):
+    """Place name -> (lat, lng). Google first (it is the best match for a name
+    that CAME from Google Maps), Mapbox as fallback. None if neither answers.
+
+    Module level because two callers need it: the link-parsing endpoint the
+    desktop assignment bar uses, and saving a client whose location was given
+    as a share link. It used to be nested inside the first of those.
+    """
+    if not name:
+        return None
+    from django.conf import settings as _dj
+    import requests as _rq
+
+    google_key = getattr(_dj, 'GOOGLE_GEOCODING_KEY', '') or ''
+    mapbox_token = getattr(_dj, 'MAPBOX_TOKEN', '') or ''
+
+    if google_key:
+        try:
+            r = _rq.get('https://maps.googleapis.com/maps/api/geocode/json',
+                        params={'address': name, 'key': google_key, 'region': 'il'},
+                        timeout=10)
+            if r.status_code == 200:
+                results = r.json().get('results') or []
+                if results:
+                    loc = results[0]['geometry']['location']
+                    return (float(loc['lat']), float(loc['lng']))
+        except Exception:
+            pass
+    if mapbox_token:
+        try:
+            import urllib.parse as _up
+            q = _up.quote(name)
+            r = _rq.get(
+                f'https://api.mapbox.com/geocoding/v5/mapbox.places/{q}.json',
+                params={'access_token': mapbox_token, 'country': 'il', 'limit': 1},
+                timeout=10)
+            if r.status_code == 200:
+                feats = r.json().get('features') or []
+                if feats:
+                    centre = feats[0]['center']      # [lng, lat]
+                    return (float(centre[1]), float(centre[0]))
+        except Exception:
+            pass
+    return None
+
+
+def _resolve_client_location(client, location_url=None):
+    """Fill a client's coordinates from a pasted map link, best effort.
+
+    Returns True when coordinates were set. A link that cannot be parsed is
+    kept on the record rather than rejected: the office should not be blocked
+    from saving a customer because a share link was an unusual shape, and the
+    address is still there to navigate by.
+    """
+    url = (location_url or client.location_url or '').strip()
+    if not url:
+        return False
+    try:
+        from .location_url_parser import parse as parse_location
+        coords = parse_location(url, geocode=geocode_place_name)
+    except Exception as exc:
+        print(f"[CLIENT-LOC] parse failed for client {client.pk}: {exc}", flush=True)
+        return False
+    if not coords:
+        return False
+    client.latitude, client.longitude = coords
+    return True
+
+
+class ClientDirectoryView(APIView):
+    """The saved-customer list, readable by drivers as well as managers.
+
+    Separate from billing/clients/ because that one is the office's editable
+    list; this is the picker. It is read-only, active-only, and returns the
+    fields a stop is built from, so the phone is not downloading tax ids and
+    payment terms to draw a search list.
+    """
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request):
+        # package_orders, not the old standing list: what a client is owed
+        # now belongs to a delivery date.
+        qs = Client.objects.filter(is_active=True).prefetch_related(
+            'package_orders__package')
+        search = (request.query_params.get('q') or '').strip()
+        if search:
+            qs = qs.filter(
+                models.Q(name__icontains=search) |
+                models.Q(site_name__icontains=search) |
+                models.Q(address__icontains=search) |
+                models.Q(site_address__icontains=search)
+            )
+        with_packages = request.query_params.get('with_packages') == '1'
+        serializer = ClientDetailSerializer if with_packages else ClientSerializer
+        return Response(serializer(qs, many=True).data)
+
+
+class PackageOrderListCreateView(APIView):
+    """Packages owed, filtered the way the office actually asks.
+
+        ?date=2026-08-20              everything due that day
+        ?client=4&date=2026-08-20     what this customer needs that day
+        ?status=undelivered           the reschedule queue
+        ?open=1                       anything still owed, any date
+        ?from=...&to=...              a range, for the week view
+    """
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request):
+        rows = PackageOrder.objects.select_related('client', 'package')
+        params = request.query_params
+
+        if params.get('client'):
+            rows = rows.filter(client_id=params['client'])
+        if params.get('date'):
+            rows = rows.filter(delivery_date=params['date'])
+        if params.get('from'):
+            rows = rows.filter(delivery_date__gte=params['from'])
+        if params.get('to'):
+            rows = rows.filter(delivery_date__lte=params['to'])
+        if params.get('status'):
+            rows = rows.filter(status=params['status'])
+        if params.get('open') == '1':
+            rows = rows.filter(status__in=PackageOrder.OPEN_STATUSES)
+        if params.get('stop'):
+            rows = rows.filter(stop_id=params['stop'])
+
+        return Response(PackageOrderSerializer(rows, many=True).data)
+
+    def post(self, request):
+        if not getattr(request, 'manager', None):
+            return Response({'error': 'Managers only'}, status=403)
+
+        # Accept one row or a list, because the office assigns a day's load in
+        # one go far more often than a single line.
+        payload = request.data
+        many = isinstance(payload, list)
+        rows = payload if many else [payload]
+
+        created, errors = [], []
+        for index, row in enumerate(rows):
+            ser = PackageOrderSerializer(data=row)
+            if ser.is_valid():
+                created.append(ser.save())
+            else:
+                errors.append({'index': index, 'errors': ser.errors})
+
+        if errors and not created:
+            return Response({'errors': errors}, status=400)
+        body = {'created': PackageOrderSerializer(created, many=True).data}
+        if errors:
+            # Partial success is worth saying out loud rather than silently
+            # dropping the lines that failed.
+            body['errors'] = errors
+        return Response(body if many else body['created'][0], status=201)
+
+
+class PackageOrderDetailView(APIView):
+    permission_classes = [IsManager]
+
+    def get(self, request, pk):
+        return Response(PackageOrderSerializer(
+            get_object_or_404(PackageOrder, pk=pk)).data)
+
+    def patch(self, request, pk):
+        order = get_object_or_404(PackageOrder, pk=pk)
+        ser = PackageOrderSerializer(order, data=request.data, partial=True)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data)
+        return Response(ser.errors, status=400)
+
+    def delete(self, request, pk):
+        order = get_object_or_404(PackageOrder, pk=pk)
+        if order.status == 'delivered':
+            # Deleting a delivered line would erase the record that it went
+            # out. Cancelling is the honest version.
+            return Response({'error': 'Delivered orders cannot be deleted'},
+                            status=400)
+        order.delete()
+        return Response(status=204)
+
+
+class PackageOrderRescheduleView(APIView):
+    """Move an order to another day, or several at once.
+
+    The whole point of the undelivered flag: the office filters to it, picks a
+    new date, and the rows go back into the queue carrying their history.
+    """
+    permission_classes = [IsManager]
+
+    def post(self, request):
+        new_date = request.data.get('delivery_date')
+        if not new_date:
+            return Response({'error': 'delivery_date is required'}, status=400)
+
+        ids = request.data.get('orders') or request.data.get('ids') or []
+        if isinstance(ids, (int, str)):
+            ids = [ids]
+        if not ids:
+            return Response({'error': 'orders is required'}, status=400)
+
+        moved, refused = [], []
+        for order in PackageOrder.objects.filter(pk__in=ids):
+            if order.status == 'delivered':
+                refused.append({'id': order.pk, 'reason': 'already delivered'})
+                continue
+            order.reschedule_to(new_date)
+            moved.append(order)
+
+        return Response({
+            'moved': PackageOrderSerializer(moved, many=True).data,
+            'refused': refused,
+        })
+
+
+class CatalogPackageListCreateView(APIView):
+    """The company's package catalogue."""
+    permission_classes = [IsManagerOrDriver]
+
+    def get(self, request):
+        qs = CatalogPackage.objects.all()
+        if request.query_params.get('active') == '1':
+            qs = qs.filter(is_active=True)
+        search = (request.query_params.get('q') or '').strip()
+        if search:
+            qs = qs.filter(
+                models.Q(name__icontains=search) |
+                models.Q(code__icontains=search) |
+                models.Q(package_number__icontains=search) |
+                models.Q(barcode__icontains=search)
+            )
+        return Response(CatalogPackageSerializer(qs, many=True).data)
+
+    def post(self, request):
+        if not getattr(request, 'manager', None):
+            return Response({'error': 'Managers only'}, status=403)
+        ser = CatalogPackageSerializer(data=request.data)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data, status=201)
+        return Response(ser.errors, status=400)
+
+
+class CatalogPackageDetailView(APIView):
+    permission_classes = [IsManager]
+
+    def get(self, request, pk):
+        return Response(CatalogPackageSerializer(
+            get_object_or_404(CatalogPackage, pk=pk)).data)
+
+    def patch(self, request, pk):
+        package = get_object_or_404(CatalogPackage, pk=pk)
+        ser = CatalogPackageSerializer(package, data=request.data, partial=True)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data)
+        return Response(ser.errors, status=400)
+
+    def delete(self, request, pk):
+        """Deactivate rather than delete when the package has been ordered.
+
+        The FK from PackageOrder is PROTECT, so a delete would fail anyway —
+        and it should: removing a catalogue row would erase what was on past
+        deliveries.
+        """
+        package = get_object_or_404(CatalogPackage, pk=pk)
+        if package.orders.exists():
+            package.is_active = False
+            package.save(update_fields=['is_active'])
+            return Response({'deactivated': True,
+                             'reason': 'used by package orders'}, status=200)
+        package.delete()
+        return Response(status=204)
+
+
+class StopFromClientView(APIView):
+    """Build a stop on a schedule from a saved client — the fast path.
+
+    This is the whole point of the directory: the office (or the driver, on
+    their own schedule) picks a customer and gets a stop already carrying the
+    address, the coordinates, the site contact and the standing instructions,
+    plus the packages that customer normally takes.
+
+    It creates exactly the same Stop rows the manual form does. Anything the
+    caller sends explicitly wins over the client's saved value, so a one-off
+    delivery to a different address is still one request.
+    """
+    permission_classes = [IsManagerOrDriver]
+
+    def post(self, request, schedule_id):
+        schedule = get_object_or_404(DailySchedule, pk=schedule_id)
+
+        # A driver may only build stops onto their own day.
+        driver = getattr(request, 'driver', None)
+        if driver is not None and schedule.driver_id != driver.id:
+            return Response({'error': 'Not your schedule'}, status=403)
+
+        client_id = request.data.get('client')
+        if not client_id:
+            return Response({'error': 'client is required'}, status=400)
+        client = get_object_or_404(Client, pk=client_id)
+
+        data = request.data
+
+        def pick(key, fallback):
+            """Caller's value if they sent a non-empty one, else the client's."""
+            value = data.get(key)
+            return value if value not in (None, '') else fallback
+
+        order = data.get('order') or (schedule.stops.aggregate(
+            models.Max('order'))['order__max'] or 0) + 1
+
+        stop = Stop.objects.create(
+            schedule      = schedule,
+            client        = client,
+            order         = order,
+            site_name     = pick('site_name', client.route_label),
+            address       = pick('address', client.route_address),
+            latitude      = pick('latitude', client.latitude),
+            longitude     = pick('longitude', client.longitude),
+            contact_name  = pick('contact_name',
+                                 client.site_contact_name or client.contact_name),
+            contact_phone = pick('contact_phone',
+                                 client.site_contact_phone or client.phone),
+            contact_email = pick('contact_email', client.email),
+            notes         = pick('notes', client.delivery_notes),
+            stop_type     = data.get('stop_type') or 'delivery',
+            expected_arrival     = data.get('expected_arrival') or None,
+            allow_driver_reorder = data.get('allow_driver_reorder', True),
+        )
+
+        # Packages. Default is the client's saved list; the caller can send an
+        # explicit selection instead, as [{package: id, quantity: n}, ...].
+        created_packages = self._add_packages(stop, client, data)
+        if created_packages:
+            # A stop carrying packages is a package delivery, whatever the
+            # caller called it — the driver app keys its load/check flow off
+            # this, and getting it wrong hides the package list from them.
+            stop.stop_type = 'package_delivery'
+            stop.save(update_fields=['stop_type'])
+
+        publish_event('schedules_changed',
+                      by_user_id=getattr(request.manager, 'id', None)
+                      if getattr(request, 'manager', None) else None)
+
+        payload = StopSerializer(stop).data
+        payload['packages_created'] = created_packages
+        return Response(payload, status=201)
+
+    @staticmethod
+    def _add_packages(stop, client, data) -> int:
+        """Attach the packages this client is owed on this stop's date.
+
+        The orders are the plan; the Package rows created here are what the
+        driver actually loads and checks off. Attaching claims the order — it
+        moves to 'scheduled' and points at this stop, so building a second stop
+        for the same customer and day cannot send the same pallets twice.
+
+        Only open orders are taken. Anything already delivered stays delivered.
+        """
+        selection = data.get('packages')
+        if selection in ([], ''):
+            return 0                    # explicitly a bare stop
+
+        # Unclaimed only. OPEN_STATUSES includes 'scheduled', which is exactly
+        # the state of an order already riding on another stop — filtering on
+        # it would let a second stop for the same customer and day send the
+        # same pallets twice. An order whose stop was deleted goes back in the
+        # pool: SET_NULL leaves it 'scheduled' with nothing to ride on.
+        orders = PackageOrder.objects.select_related('package').filter(
+            client=client,
+            delivery_date=stop.schedule.date,
+        ).filter(
+            models.Q(status__in=('pending', 'undelivered')) |
+            models.Q(status='scheduled', stop__isnull=True)
+        )
+        if selection:
+            # An explicit pick, by order id.
+            ids = [entry.get('order') or entry.get('id') if isinstance(entry, dict)
+                   else entry for entry in selection]
+            orders = orders.filter(pk__in=[i for i in ids if i])
+
+        made = 0
+        for order in orders:
+            try:
+                Package.objects.create(
+                    stop=stop,
+                    **order.package.as_stop_package_kwargs(order.quantity))
+                order.status = 'scheduled'
+                order.stop = stop
+                order.save(update_fields=['status', 'stop', 'updated_at'])
+                made += 1
+            except Exception as exc:
+                # One bad row must not cost the office the whole stop.
+                print(f"[STOP-FROM-CLIENT] order {order.pk} skipped: {exc}",
+                      flush=True)
+        return made
